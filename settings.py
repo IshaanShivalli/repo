@@ -14,7 +14,6 @@ from block_textures import BlockType, BLOCK_DATA
 # ═══════════════════════════════════════════════════════════════════════
 #  CONSTANTS
 # ═══════════════════════════════════════════════════════════════════════
-
 CHUNK_SIZE       = 16
 CHUNK_HEIGHT     = 64
 SEA_LEVEL        = 32
@@ -39,6 +38,19 @@ USE_TEXTURES     = True
 USE_GREEDY_MESH  = False
 SHOW_ALL_FACES   = True
 USE_WATER        = True          # ← ocean enabled
+WATER_GRAVITY_SCALE   = 0.18   # fraction of normal gravity while submerged
+WATER_HORIZ_DRAG      = 0.82   # per-frame velocity multiplier (< 1 = drag)
+WATER_VERT_DRAG       = 0.78   # tighter vertical drag than horizontal
+WATER_SINK_CAP        = -2.5   # terminal velocity while sinking in water
+WATER_RISE_CAP        =  2.5   # max upward speed while swimming
+WATER_SWIM_FORCE      =  6.0   # upward impulse when pressing SPACE underwater
+WATER_SURFACE_JUMP    =  7.5   # jump velocity when exiting water from surface
+AIR_MAX               = 20.0   # seconds of air (= 10 "bubbles")
+DROWN_DAMAGE_RATE     =  1.0   # HP per second when air is empty
+BUOYANCY_STRENGTH     =  9.0   # upward force when fully submerged (blocks/s²)
+
+
+
 
 # ═══════════════════════════════════════════════════════════════════════
 #  BLOCK-TYPE REGISTRY  (index == integer stored in chunk arrays)
@@ -78,11 +90,6 @@ _BT_LIST = [
     BlockType.SEAGRASS,
     BlockType.PRISMARINE,
 ]
-
-
-
-
-
 BT: dict = {bt: i for i, bt in enumerate(_BT_LIST)}
 N_BLOCK_TYPES = len(_BT_LIST)
 
@@ -301,32 +308,3 @@ def _lookat(eye: np.ndarray, forward: np.ndarray) -> np.ndarray:
     m[1, :3] =  up;      m[1, 3] = -np.dot(up,       eye)
     m[2, :3] = -forward; m[2, 3] =  np.dot(forward,  eye)
     return m
-
-# ═══════════════════════════════════════════════════════════════════════
-#  EXPORTED BLOCK IDS (for terrain / gameplay code)
-# ═══════════════════════════════════════════════════════════════════════
-
-ID_AIR            = BT[BlockType.AIR]
-ID_GRASS          = BT[BlockType.GRASS]
-ID_DIRT           = BT[BlockType.DIRT]
-ID_STONE          = BT[BlockType.STONE]
-ID_SAND           = BT[BlockType.SAND]
-ID_SNOW           = BT[BlockType.SNOW]
-ID_BEDROCK        = BT[BlockType.BEDROCK]
-ID_WATER          = BT[BlockType.WATER]
-
-ID_LOG            = BT[BlockType.OAK_LOG]
-ID_LEAVES         = BT[BlockType.OAK_LEAVES]
-ID_SPRUCE_LOG     = BT[BlockType.SPRUCE_LOG]
-ID_SPRUCE_LEAVES  = BT[BlockType.SPRUCE_LEAVES]
-ID_CACTUS         = BT[BlockType.CACTUS]
-
-ID_COAL           = BT[BlockType.COAL_ORE]
-ID_IRON           = BT[BlockType.IRON_ORE]
-ID_GOLD           = BT[BlockType.GOLD_ORE]
-ID_DIAMOND        = BT[BlockType.DIAMOND_ORE]
-
-# Ocean biome
-ID_SAND_OCEAN     = BT[BlockType.SAND_OCEAN]
-ID_KELP           = BT[BlockType.KELP]
-ID_SEAGRASS       = BT[BlockType.SEAGRASS]

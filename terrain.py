@@ -14,7 +14,7 @@ import numpy as np
 from numba import njit
 
 from settings import CHUNK_SIZE, CHUNK_HEIGHT, SEA_LEVEL, BEDROCK_LEVEL, OCEAN_FLOOR
-WATER_BLOCK_ID = None
+
 
 # ═══════════════════════════════════════════════════════════════════════
 #  NOISE HELPERS
@@ -255,7 +255,7 @@ def gen_chunk(cx: int, cz: int, seed: int,
 @njit(cache=True)
 def build_mesh(blk, nb_x_neg, nb_x_pos, nb_z_neg, nb_z_pos,
                render, occlude, rot, colors, face_uv,
-               cx, cz, greedy, show_all, water_id):
+               cx, cz, greedy, show_all):
     """
     Build a flat float32 vertex buffer for one chunk.
 
@@ -308,22 +308,17 @@ def build_mesh(blk, nb_x_neg, nb_x_pos, nb_z_neg, nb_z_pos,
                             nidx = [0, 0, 0]
                             nidx[axis] = ni; nidx[a_ax] = a; nidx[b_ax] = b
                             nbt = blk[nidx[0], nidx[1], nidx[2]]
-                            if occlude[nbt] == 1:
-                                continue
-                            if bt == water_id and nbt == water_id:
+                            if occlude[nbt] == 1 or nbt == bt:
                                 continue
                         else:
                             if axis == 0:
                                 nbt = nb_x_neg[a, b] if ndir < 0 else nb_x_pos[a, b]
+                                if occlude[nbt] == 1 or nbt == bt:
+                                    continue
                             elif axis == 2:
                                 nbt = nb_z_neg[a, b] if ndir < 0 else nb_z_pos[a, b]
-                            else:
-                                nbt = 0
-
-                            if occlude[nbt] == 1:
-                                continue
-                            if bt == water_id and nbt == water_id:
-                                continue
+                                if occlude[nbt] == 1 or nbt == bt:
+                                    continue
 
                     mask[a, b] = bt
 

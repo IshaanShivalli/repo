@@ -4,7 +4,7 @@ Defines all block types and their visual / gameplay properties.
 """
 
 TEX_BASE = "textures/assets/minecraft/textures/block"
-
+TEX_GUI = "textures/assets/minecraft/textures/paricle"
 class _Color:
     @staticmethod
     def rgb(r, g, b):       return (r, g, b)
@@ -18,6 +18,8 @@ class _Color:
 color = _Color()
 
 class BlockType:
+    HEART          = "heart"
+    BREATH         = "breath"
     AIR            = "air"
     GRASS          = "grass"
     DIRT           = "dirt"
@@ -60,12 +62,27 @@ class BlockType:
     PRISMARINE     = "prismarine"
 
 
+
+
 BLOCK_DATA = {
 
     BlockType.AIR: {
         "color": color.rgba(0, 0, 0, 0),
         "solid": False,
         "drops": None,
+    },
+
+    BlockType.HEART: {
+        "color":         color.rgb(255, 0, 0),
+        "texture":  f"{TEX_GUI}/heart.png",
+        # "texture_half":  f"{TEX_GUI}/heart_half.png",
+        # "texture_empty": f"{TEX_GUI}/heart_empty.png",
+        "solid": False, 
+    },
+    BlockType.BREATH: {
+        "color":         color.rgb(0, 190, 255),
+        "texture":  f"{TEX_GUI}/bubble.png",
+        "solid": False,
     },
 
     BlockType.GRASS: {
@@ -264,3 +281,4 @@ BLOCK_DATA = {
         "solid":   True, "drops": BlockType.PRISMARINE,
     },
 }
+

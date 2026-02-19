@@ -1,13 +1,27 @@
+"""
+main.py  –  Entry point.  Wires together settings, terrain, player and all
+             the rendering / UI code.
+
+Split from the original monolithic file:
+  settings.py  – constants, block arrays (incl. BT_OCCLUDE transparency fix),
+                  texture atlas, face UV / colour tables, matrix helpers.
+  terrain.py   – Numba JIT gen_chunk() and build_mesh().
+  player.py    – Player physics, collision, raycast.
+"""
+
 import math
 import os
 import random
 import time as _time
 from collections import deque
+
 import numpy as np
 import pyglet
 import pyglet.gl as gl
 from pyglet.window import key, mouse
 import moderngl
+
+# ── project modules ───────────────────────────────────────────────────────────
 from block_textures import BlockType, BLOCK_DATA
 from inventory_system import PlayerInventorySystem, ItemType, FOOD_DATA, RECIPES, FURNACE_RECIPES, FUEL_DATA
 from mobs import MobManager, MobType, Vec3 as MobVec3
@@ -34,6 +48,30 @@ from player import Player
 SEED = random.randint(1, 999_999_999_999)
 print(f"World seed : {SEED}")
 print(f"View dist  : {VIEW_DISTANCE}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  GLSL
+# ═══════════════════════════════════════════════════════════════════════
+PARTICLE_VERT = """
+#version 330 core
+in vec3 in_pos; in vec2 in_uv;
+uniform mat4 u_mvp;
+out vec2 v_uv;
+void main() {
+    gl_Position = u_mvp * vec4(in_pos, 1.0);
+    v_uv = in_uv;
+}"""
+
+PARTICLE_FRAG = """
+#version 330 core
+in vec2 v_uv; uniform sampler2D u_tex; uniform float u_alpha;
+out vec4 frag_color;
+void main() {
+    vec4 t = texture(u_tex, v_uv);
+    if(t.a < 0.1) discard;
+    frag_color = vec4(t.rgb, t.a * u_alpha);
+}"""
 
 VERT_GLSL = """
 #version 330 core
@@ -82,10 +120,15 @@ in vec2 v_uv; uniform sampler2D u_tex; out vec4 frag_color;
 void main() { vec4 t=texture(u_tex,v_uv); if(t.a<0.01)discard; frag_color=t; }"""
 
 
+# ═══════════════════════════════════════════════════════════════════════
+#  WORLD
+# ═══════════════════════════════════════════════════════════════════════
 class Chunk:
     __slots__ = ('cx', 'cz', 'blocks', 'dirty')
     def __init__(self, cx, cz, blocks):
         self.cx=cx; self.cz=cz; self.blocks=blocks; self.dirty=True
+
+
 
 
 class World:
@@ -158,6 +201,8 @@ class World:
                 if nb:
                     nb.dirty = True
                     if nb not in self.dirty_queue: self.dirty_queue.appendleft(nb)
+        # Trigger water flow evaluation whenever a block changes
+        self.schedule_water(wx, wy, wz)
 
     def is_solid(self, wx, wy, wz):
         bt = self.get_block(int(math.floor(wx)), int(math.floor(wy)), int(math.floor(wz)))
@@ -181,8 +226,60 @@ class World:
                 return False
         return True
 
+    # ── water flow simulation ─────────────────────────────────────────────────
+    # We keep a pending set of (wx,wy,wz) blocks that need to be checked for
+    # flow. When a block is placed / removed we schedule its neighbours.
+    # Each tick we process a bounded batch so it never stalls the frame.
+
+    def _init_water(self):
+        if not hasattr(self, '_water_queue'):
+            self._water_queue: deque = deque()
+            self._water_scheduled: set = set()
+
+    def schedule_water(self, wx: int, wy: int, wz: int):
+        """Mark a position (and its neighbours) for water-flow evaluation."""
+        self._init_water()
+        for pos in [(wx,wy,wz),(wx-1,wy,wz),(wx+1,wy,wz),
+                    (wx,wy-1,wz),(wx,wy+1,wz),(wx,wy,wz-1),(wx,wy,wz+1)]:
+            if pos not in self._water_scheduled:
+                self._water_scheduled.add(pos)
+                self._water_queue.append(pos)
+
+    def _water_tick(self, max_ops: int = 64):
+        """Process up to max_ops water-flow steps."""
+        self._init_water()
+        ID_WATER = BT.get(BlockType.WATER, 0)
+        if not ID_WATER:
+            return
+        ops = 0
+        while self._water_queue and ops < max_ops:
+            pos = self._water_queue.popleft()
+            self._water_scheduled.discard(pos)
+            ops += 1
+            wx, wy, wz = pos
+            bt = self.get_block(wx, wy, wz)
+
+            # Only flow from a source water block
+            if bt != ID_WATER:
+                continue
+
+            # Flow downward first
+            below_bt = self.get_block(wx, wy - 1, wz)
+            if below_bt == 0:  # air below → fall straight down
+                self.set_block(wx, wy - 1, wz, ID_WATER)
+                self.schedule_water(wx, wy - 1, wz)
+                continue  # downward flow takes priority – skip horizontal
+
+            # Spread horizontally into adjacent air blocks (up to 4 neighbours)
+            for nx, nz in ((wx-1,wz),(wx+1,wz),(wx,wz-1),(wx,wz+1)):
+                nb_bt = self.get_block(nx, wy, nz)
+                if nb_bt == 0:  # empty air → fill with water
+                    self.set_block(nx, wy, nz, ID_WATER)
+                    self.schedule_water(nx, wy, nz)
+
     def tick(self, dt):
         self.time_of_day = (self.time_of_day + DAY_TICK_SPEED * dt) % 24000.0
+        self._water_tick()
 
     def sky(self):
         t = self.time_of_day
@@ -212,6 +309,9 @@ class World:
         else:                     return "🌄 Sunrise"
 
 
+# ═══════════════════════════════════════════════════════════════════════
+#  RENDERER
+# ═══════════════════════════════════════════════════════════════════════
 class Renderer:
     def __init__(self, ctx):
         self.ctx  = ctx
@@ -269,6 +369,12 @@ class Renderer:
         back  = world.chunks.get((ch.cx, ch.cz-1));  back  and nb_z_neg.__setitem__(slice(None), back.blocks[:,:,S-1])
         front = world.chunks.get((ch.cx, ch.cz+1));  front and nb_z_pos.__setitem__(slice(None), front.blocks[:,:,0])
 
+        # ── KEY FIX: pass BT_OCCLUDE (not BT_SOLID) as the occlusion mask ────
+        # BT_SOLID includes leaves and cactus (solid=True, transparent=True).
+        # Using BT_SOLID caused adjacent leaf/cactus faces to be culled away,
+        # making the blocks appear hollow or completely invisible.
+        # BT_OCCLUDE = solid AND NOT transparent, so only truly opaque blocks
+        # hide their neighbours' faces.
         vdata = build_mesh(
             ch.blocks, nb_x_neg, nb_x_pos, nb_z_neg, nb_z_pos,
             BT_RENDER, BT_OCCLUDE, BT_ROT, FACE_COLORS, FACE_UV,
@@ -385,6 +491,9 @@ class Renderer:
             self.ctx.wireframe = False
 
 
+# ═══════════════════════════════════════════════════════════════════════
+#  UI SYSTEM  (unchanged from original)
+# ═══════════════════════════════════════════════════════════════════════
 
 _icon_cache: dict = {}
 
@@ -650,7 +759,8 @@ class HotbarUI:
 class StatusBarsUI:
     def __init__(self,win,batch):
         self._win=win; self._batch=batch; self._shapes=[]
-        self._hp=self._hg=self._xp=None; self._hp_w=self._hg_w=self._xp_w=0
+        self._hp=self._hg=self._xp=self._air=None
+        self._hp_w=self._hg_w=self._xp_w=self._air_w=0
         self._rebuild()
     def _rebuild(self):
         for s in self._shapes: s.delete()
@@ -668,11 +778,27 @@ class StatusBarsUI:
         hp_fg=pyglet.shapes.Rectangle(x0+tw-hw,bar_y,0, 8,color=(220,50,50),batch=self._batch)
         self._shapes+=[hg_bg,hg_fg,hp_bg,hp_fg]
         self._hg=hg_fg; self._hg_w=hw; self._hp=hp_fg; self._hp_w=hw
+        # Air bubble bar – shown only when underwater; sits above health bar
+        air_y=bar_y+12
+        air_bg=pyglet.shapes.Rectangle(x0+tw-hw,air_y,hw,6,color=(20,20,60),batch=self._batch)
+        air_fg=pyglet.shapes.Rectangle(x0+tw-hw,air_y,0, 6,color=(80,200,255),batch=self._batch)
+        self._shapes+=[air_bg,air_fg]
+        self._air=air_fg; self._air_w=hw
+        air_bg.visible=False; air_fg.visible=False
+        self._air_bg=air_bg
     def update(self,player):
         if not player: return
         self._hp.width=int(self._hp_w*player.health/player.max_health)
         self._hg.width=int(self._hg_w*player.hunger/player.max_hunger)
         self._xp.width=int(self._xp_w*(player.xp%100)/100.)
+        # Show air bubble bar only when submerged
+        AIR_MAX = 10.0  # must match player.AIR_MAX
+        show_air = getattr(player, 'head_in_water', False)
+        self._air_bg.visible = show_air
+        self._air.visible    = show_air
+        if show_air:
+            air_frac = getattr(player, 'air', AIR_MAX) / AIR_MAX
+            self._air.width = int(self._air_w * air_frac)
     def resize(self): self._rebuild()
 
 
@@ -1105,10 +1231,20 @@ class UIManager:
                        f"  ({int(world.time_of_day/1000):02d}:00)  Biome:{bname}")
         self._l2.text=(f"XYZ {player.x:.1f} {player.y:.1f} {player.z:.1f}"
                        f"  Chunks:{len(world.chunks)}")
+        water_str = ""
+        if getattr(player,'head_in_water',False):
+            air_pct = int(getattr(player,'air',10.0) / 10.0 * 100)
+            water_str = f"  🌊 Air:{air_pct}%"
+        elif getattr(player,'in_water',False):
+            water_str = "  🌊 Swimming"
         self._l3.text=(f"HP {int(player.health)}/20  Hunger {int(player.hunger)}/20"
-                       f"  XP {player.xp}")
-        hint=("[ESC/E to close]" if self.is_open else
-              f"[{sel}]  WASD  Space=jump  LMB=mine  RMB=place  1-9=slot  F=eat  E=inv")
+                       f"  XP {player.xp}{water_str}")
+        if self.is_open:
+            hint="[ESC/E to close]"
+        elif getattr(player,'in_water',False):
+            hint=f"[{sel}]  WASD=swim  Space=rise  Shift=dive  LMB=mine  RMB=place"
+        else:
+            hint=f"[{sel}]  WASD  Space=jump  LMB=mine  RMB=place  1-9=slot  F=eat  E=inv"
         self._l4.text=hint
         self._bars.update(player); self._hotbar.refresh(inv)
     def draw(self):
@@ -1315,6 +1451,9 @@ class UIManager:
         elif mode==self.FURNACE: self._fur_scr.show(inv)
 
 
+# ═══════════════════════════════════════════════════════════════════════
+#  GAME WINDOW
+# ═══════════════════════════════════════════════════════════════════════
 class GameWindow(pyglet.window.Window):
     def __init__(self):
         cfg = pyglet.gl.Config(major_version=3, minor_version=3,
@@ -1500,6 +1639,8 @@ class GameWindow(pyglet.window.Window):
     def on_close(self):
         pyglet.app.exit()
 
+
+# ═══════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     win = GameWindow()
     print("Running!")
