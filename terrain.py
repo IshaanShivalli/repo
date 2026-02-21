@@ -14,6 +14,7 @@ import numpy as np
 from numba import njit
 
 from settings import CHUNK_SIZE, CHUNK_HEIGHT, SEA_LEVEL, BEDROCK_LEVEL, OCEAN_FLOOR
+from water_gen import fill_ocean_column, place_ocean_plants, lake_water_top, ocean_floor_height
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -97,7 +98,7 @@ def _is_coast(wx: int, wz: int, seed: int) -> bool:
 
 
 @njit(cache=True)
-def _ocean_floor_height(wx: int, wz: int, seed: int) -> int:
+def ocean_floor_height(wx: int, wz: int, seed: int) -> int:
     """Varied ocean floor between OCEAN_FLOOR and SEA_LEVEL-4."""
     n = _noise2(float(wx) * 0.05, float(wz) * 0.05, seed ^ 0xABCD)
     h = OCEAN_FLOOR + int((n * 0.5 + 0.5) * (SEA_LEVEL - 6 - OCEAN_FLOOR))
@@ -127,26 +128,13 @@ def gen_chunk(cx: int, cz: int, seed: int,
             wz    = cz * S + dz
             biome = _biome_at(wx, wz, seed)
 
-            # ── Ocean biome ──────────────────────────────────────────────────
+                        # ── Ocean biome (see water_gen.py) ───────────────────
             if biome == 4:
-                floor_y = _ocean_floor_height(wx, wz, seed)
-
-                for y in range(H):
-                    if y <= BEDROCK_LEVEL:
-                        blk[dx, y, dz] = ID_BEDROCK
-                    elif y <= BEDROCK_LEVEL + 2:
-                        lcg = (lcg * 1664525 + 1013904223) & 0xFFFFFFFF
-                        blk[dx, y, dz] = ID_BEDROCK if (lcg & 0xFF) < 180 else ID_STONE
-                    elif y < floor_y - 2:
-                        blk[dx, y, dz] = ID_STONE
-                    elif y < floor_y:
-                        blk[dx, y, dz] = ID_SAND_OCEAN
-                    elif y == floor_y:
-                        blk[dx, y, dz] = ID_SAND_OCEAN
-                    elif y <= SEA_LEVEL:
-                        blk[dx, y, dz] = ID_WATER
+                lcg = fill_ocean_column(blk, dx, dz, wx, wz, seed, lcg,
+                    ID_BEDROCK, ID_STONE, ID_SAND_OCEAN, ID_WATER)
 
                 # Ore pockets in ocean stone
+                floor_y = ocean_floor_height(wx, wz, seed)  # recompute for ores
                 for _ in range(3):
                     lcg = (lcg * 1664525 + 1013904223) & 0xFFFFFFFF
                     oy  = BEDROCK_LEVEL + 3 + int(lcg & 0x1F)
@@ -162,10 +150,13 @@ def gen_chunk(cx: int, cz: int, seed: int,
 
             # ── Land biomes ──────────────────────────────────────────────
             height = _terrain_height(wx, wz, seed)
-
             # Coast detection: land cells within ~6 blocks of ocean get sand
             # surface and subsurface, regardless of biome.
             coast = _is_coast(wx, wz, seed)
+            # Inland lake/pond fill - not in snow biome or coast
+            _water_top = -1
+            if biome != 3 and not coast:
+                _water_top = lake_water_top(wx, wz, height, seed)
 
             if coast:
                 surf = ID_SAND
@@ -188,18 +179,17 @@ def gen_chunk(cx: int, cz: int, seed: int,
                     # Coast: use sand subsurface instead of dirt
                     blk[dx, y, dz] = ID_SAND if coast else ID_DIRT
                 elif y == height:
-                    blk[dx, y, dz] = surf
+                    # If this column has water above it, use dirt not grass
+                    if _water_top > height:
+                        blk[dx, y, dz] = ID_DIRT
+                    else:
+                        blk[dx, y, dz] = surf
                 elif height < SEA_LEVEL - 2:
-                    # Lake fill: water surface at SEA_LEVEL, solid bed below
-                    # Every block from height+1 to SEA_LEVEL is filled (no air gaps)
+                    # Ocean/deep lake: water at SEA_LEVEL
                     if y == SEA_LEVEL:
                         blk[dx, y, dz] = ID_WATER
-                    elif y > height:
-                        # Fill the lake bed solidly to prevent water pillars
-                        if y >= SEA_LEVEL - 3:
-                            blk[dx, y, dz] = ID_SAND
-                        else:
-                            blk[dx, y, dz] = ID_STONE
+                elif _water_top > 0 and y == _water_top and height < _water_top:
+                    blk[dx, y, dz] = ID_WATER
 
             # ── Cave carving (land only) ──────────────────────────────────
             # Big irregular chambers: low threshold on combined multi-octave noise.
@@ -246,25 +236,10 @@ def gen_chunk(cx: int, cz: int, seed: int,
             biome = _biome_at(wx, wz, seed)
             lcg   = (lcg * 1664525 + 1013904223) & 0xFFFFFFFF
 
-            # ── Ocean underwater plants ───────────────────────────────────────
+            # ── Ocean underwater plants (see water_gen.py) ────────────
             if biome == 4:
-                floor_y = _ocean_floor_height(wx, wz, seed)
-                above   = floor_y + 1
-                if above >= SEA_LEVEL or above >= H:
-                    continue
-
-                rv = lcg & 0xFF
-                if rv < 40:
-                    # Kelp column — grows 2-6 blocks upward through water
-                    kelp_h = 2 + int(lcg & 0x7) % 5
-                    for ky in range(above, min(above + kelp_h, SEA_LEVEL)):
-                        if blk[dx, ky, dz] == ID_WATER:
-                            blk[dx, ky, dz] = ID_KELP
-                elif rv < 70:
-                    # Seagrass on the floor
-                    if blk[dx, above, dz] == ID_WATER:
-                        blk[dx, above, dz] = ID_SEAGRASS
-                continue
+                lcg = place_ocean_plants(blk, dx, dz, wx, wz, seed, lcg,
+                    ID_WATER, ID_KELP, ID_SEAGRASS)
 
             # ── Land surface features ────────────────────────────────────────
             h  = _terrain_height(wx, wz, seed)

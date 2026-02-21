@@ -381,6 +381,9 @@ def _face_uvs(ox: int, oy: int, px: int, py: int, pz: int,
       front:  rect(ox+pz,        oy+pz,    px, py)
       left:   rect(ox+pz+px,     oy+pz,    pz, py)
       back:   rect(ox+2*pz+px,   oy+pz,    px, py)
+
+    V is flipped (1-v) because PIL loads images top-left but OpenGL
+    textures have origin at bottom-left.
     """
     rects = [
         (ox+pz,       oy,      px, pz),   # 0 top
@@ -391,8 +394,11 @@ def _face_uvs(ox: int, oy: int, px: int, py: int, pz: int,
         (ox+pz+px,    oy+pz,   pz, py),   # 5 left
     ]
     rx, ry, rw, rh = rects[face]
-    u0 = rx / sw;      v0 = ry / sh
-    u1 = (rx+rw) / sw; v1 = (ry+rh) / sh
+    u0 =  rx / sw
+    u1 = (rx + rw) / sw
+    # Flip V: PIL top-left → OpenGL bottom-left
+    v0 = 1.0 - (ry + rh) / sh
+    v1 = 1.0 -  ry / sh
     return u0, v0, u1, v1
 
 
@@ -429,53 +435,54 @@ def _box_quads(ox: int, oy: int, px: int, py: int, pz: int,
     quads = []
     face_lights = [1.0, 0.55, 0.85, 0.85, 0.75, 0.75]  # top,bot,front,back,right,left
 
-    # face 0: top  (y = y1,  xz plane)
+    # With V-flipped UVs: (u0,v0) = bottom-left of texture region, (u1,v1) = top-right
+    # face 0: top  (y = y1, xz plane) — looking down, +X=right, +Z=down in texture
     u0,v0,u1,v1 = _face_uvs(ox,oy,px,py,pz, sw,sh, 0)
     lt = face_lights[0]
     quads.append([
-        v(x0, y1, z0, u0,v0, lt), v(x1, y1, z0, u1,v0, lt),
-        v(x1, y1, z1, u1,v1, lt), v(x0, y1, z0, u0,v0, lt),
-        v(x1, y1, z1, u1,v1, lt), v(x0, y1, z1, u0,v1, lt),
+        v(x0, y1, z1, u0,v0, lt), v(x1, y1, z1, u1,v0, lt),
+        v(x1, y1, z0, u1,v1, lt), v(x0, y1, z1, u0,v0, lt),
+        v(x1, y1, z0, u1,v1, lt), v(x0, y1, z0, u0,v1, lt),
     ])
     # face 1: bottom (y = y0)
     u0,v0,u1,v1 = _face_uvs(ox,oy,px,py,pz, sw,sh, 1)
     lt = face_lights[1]
     quads.append([
-        v(x0, y0, z1, u0,v0, lt), v(x1, y0, z1, u1,v0, lt),
-        v(x1, y0, z0, u1,v1, lt), v(x0, y0, z1, u0,v0, lt),
-        v(x1, y0, z0, u1,v1, lt), v(x0, y0, z0, u0,v1, lt),
+        v(x0, y0, z0, u0,v0, lt), v(x1, y0, z0, u1,v0, lt),
+        v(x1, y0, z1, u1,v1, lt), v(x0, y0, z0, u0,v0, lt),
+        v(x1, y0, z1, u1,v1, lt), v(x0, y0, z1, u0,v1, lt),
     ])
     # face 2: front (+Z, z = z1)
     u0,v0,u1,v1 = _face_uvs(ox,oy,px,py,pz, sw,sh, 2)
     lt = face_lights[2]
     quads.append([
-        v(x0, y0, z1, u0,v1, lt), v(x1, y0, z1, u1,v1, lt),
-        v(x1, y1, z1, u1,v0, lt), v(x0, y0, z1, u0,v1, lt),
-        v(x1, y1, z1, u1,v0, lt), v(x0, y1, z1, u0,v0, lt),
+        v(x0, y0, z1, u0,v0, lt), v(x1, y0, z1, u1,v0, lt),
+        v(x1, y1, z1, u1,v1, lt), v(x0, y0, z1, u0,v0, lt),
+        v(x1, y1, z1, u1,v1, lt), v(x0, y1, z1, u0,v1, lt),
     ])
     # face 3: back (-Z, z = z0)
     u0,v0,u1,v1 = _face_uvs(ox,oy,px,py,pz, sw,sh, 3)
     lt = face_lights[3]
     quads.append([
-        v(x1, y0, z0, u0,v1, lt), v(x0, y0, z0, u1,v1, lt),
-        v(x0, y1, z0, u1,v0, lt), v(x1, y0, z0, u0,v1, lt),
-        v(x0, y1, z0, u1,v0, lt), v(x1, y1, z0, u0,v0, lt),
+        v(x1, y0, z0, u0,v0, lt), v(x0, y0, z0, u1,v0, lt),
+        v(x0, y1, z0, u1,v1, lt), v(x1, y0, z0, u0,v0, lt),
+        v(x0, y1, z0, u1,v1, lt), v(x1, y1, z0, u0,v1, lt),
     ])
     # face 4: right (+X, x = x1)
     u0,v0,u1,v1 = _face_uvs(ox,oy,px,py,pz, sw,sh, 4)
     lt = face_lights[4]
     quads.append([
-        v(x1, y0, z1, u0,v1, lt), v(x1, y0, z0, u1,v1, lt),
-        v(x1, y1, z0, u1,v0, lt), v(x1, y0, z1, u0,v1, lt),
-        v(x1, y1, z0, u1,v0, lt), v(x1, y1, z1, u0,v0, lt),
+        v(x1, y0, z0, u0,v0, lt), v(x1, y0, z1, u1,v0, lt),
+        v(x1, y1, z1, u1,v1, lt), v(x1, y0, z0, u0,v0, lt),
+        v(x1, y1, z1, u1,v1, lt), v(x1, y1, z0, u0,v1, lt),
     ])
     # face 5: left (-X, x = x0)
     u0,v0,u1,v1 = _face_uvs(ox,oy,px,py,pz, sw,sh, 5)
     lt = face_lights[5]
     quads.append([
-        v(x0, y0, z0, u0,v1, lt), v(x0, y0, z1, u1,v1, lt),
-        v(x0, y1, z1, u1,v0, lt), v(x0, y0, z0, u0,v1, lt),
-        v(x0, y1, z1, u1,v0, lt), v(x0, y1, z0, u0,v0, lt),
+        v(x0, y0, z1, u0,v0, lt), v(x0, y0, z0, u1,v0, lt),
+        v(x0, y1, z0, u1,v1, lt), v(x0, y0, z1, u0,v0, lt),
+        v(x0, y1, z0, u1,v1, lt), v(x0, y1, z1, u0,v1, lt),
     ])
     return quads
 
@@ -528,6 +535,8 @@ class MobRenderer:
                     scale = 64 // img.width
                     img = img.resize((img.width * scale, img.height * scale),
                                      resample=Image.NEAREST)
+                # Flip vertically: PIL is top-left origin, OpenGL is bottom-left
+                img = img.transpose(Image.FLIP_TOP_BOTTOM)
                 tex = self._ctx.texture(img.size, 4, img.tobytes())
                 tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
                 self._textures[mob_type] = tex
