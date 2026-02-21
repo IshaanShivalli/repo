@@ -22,7 +22,7 @@ from pyglet.window import key, mouse
 import moderngl
 
 # ── project modules ───────────────────────────────────────────────────────────
-from block_textures import BlockType, BLOCK_DATA
+from block_textures import BlockType, BLOCK_DATA, HEART_TEX, BUBBLE_FRAMES
 from inventory_system import PlayerInventorySystem, ItemType, FOOD_DATA, RECIPES, FURNACE_RECIPES, FUEL_DATA
 from mobs import MobManager, MobType, Vec3 as MobVec3
 import sun_moon
@@ -35,13 +35,13 @@ from settings import (
     ENABLE_WIREFRAME, EDGE_COLOR, EDGE_WIDTH,
     TILE_SIZE, USE_TEXTURES, USE_GREEDY_MESH, SHOW_ALL_FACES, USE_WATER,
     AIR, _BT_LIST, BT, N_BLOCK_TYPES,
-    BT_SOLID, BT_TRANS, BT_RENDER, BT_ROT,
+    BT_SOLID, BT_TRANS, BT_LIQUID, BT_RENDER, BT_ROT,
     BT_OCCLUDE,          # ← the fixed occlusion mask (solid AND opaque)
     FACE_UV, FACE_COLORS,
     _atlas_img, _uv_map, _white_key,
     _persp, _lookat, _load_image_rgba,
 )
-from terrain import gen_chunk, build_mesh, _terrain_height, _biome_at
+from terrain import gen_chunk, build_mesh, build_mesh_split, _terrain_height, _biome_at
 from player import Player
 
 # ── world seed (must be module-level so terrain/player helpers can see it) ──
@@ -53,26 +53,6 @@ print(f"View dist  : {VIEW_DISTANCE}")
 # ═══════════════════════════════════════════════════════════════════════
 #  GLSL
 # ═══════════════════════════════════════════════════════════════════════
-PARTICLE_VERT = """
-#version 330 core
-in vec3 in_pos; in vec2 in_uv;
-uniform mat4 u_mvp;
-out vec2 v_uv;
-void main() {
-    gl_Position = u_mvp * vec4(in_pos, 1.0);
-    v_uv = in_uv;
-}"""
-
-PARTICLE_FRAG = """
-#version 330 core
-in vec2 v_uv; uniform sampler2D u_tex; uniform float u_alpha;
-out vec4 frag_color;
-void main() {
-    vec4 t = texture(u_tex, v_uv);
-    if(t.a < 0.1) discard;
-    frag_color = vec4(t.rgb, t.a * u_alpha);
-}"""
-
 VERT_GLSL = """
 #version 330 core
 in vec3 in_pos; in vec3 in_normal; in vec4 in_color; in vec2 in_uv;
@@ -127,8 +107,6 @@ class Chunk:
     __slots__ = ('cx', 'cz', 'blocks', 'dirty')
     def __init__(self, cx, cz, blocks):
         self.cx=cx; self.cz=cz; self.blocks=blocks; self.dirty=True
-
-
 
 
 class World:
@@ -270,12 +248,14 @@ class World:
                 self.schedule_water(wx, wy - 1, wz)
                 continue  # downward flow takes priority – skip horizontal
 
-            # Spread horizontally into adjacent air blocks (up to 4 neighbours)
+            # Spread horizontally only into cells with a solid floor below
             for nx, nz in ((wx-1,wz),(wx+1,wz),(wx,wz-1),(wx,wz+1)):
                 nb_bt = self.get_block(nx, wy, nz)
-                if nb_bt == 0:  # empty air → fill with water
-                    self.set_block(nx, wy, nz, ID_WATER)
-                    self.schedule_water(nx, wy, nz)
+                if nb_bt == 0:
+                    below_nb = self.get_block(nx, wy - 1, nz)
+                    if below_nb != 0:
+                        self.set_block(nx, wy, nz, ID_WATER)
+                        self.schedule_water(nx, wy, nz)
 
     def tick(self, dt):
         self.time_of_day = (self.time_of_day + DAY_TICK_SPEED * dt) % 24000.0
@@ -375,28 +355,35 @@ class Renderer:
         # making the blocks appear hollow or completely invisible.
         # BT_OCCLUDE = solid AND NOT transparent, so only truly opaque blocks
         # hide their neighbours' faces.
-        vdata = build_mesh(
+        # Two-pass render: split opaque and transparent into separate VAOs
+        vdata_o, vdata_t = build_mesh_split(
             ch.blocks, nb_x_neg, nb_x_pos, nb_z_neg, nb_z_pos,
-            BT_RENDER, BT_OCCLUDE, BT_ROT, FACE_COLORS, FACE_UV,
+            BT_RENDER, BT_OCCLUDE, BT_TRANS, BT_LIQUID, BT_ROT, FACE_COLORS, FACE_UV,
             ch.cx, ch.cz,
             1 if USE_GREEDY_MESH else 0,
-            1 if SHOW_ALL_FACES  else 0,
         )
-        if vdata.size == 0:
+        if vdata_o.size == 0 and vdata_t.size == 0:
             ch.dirty = False;  return
 
-        vbo = self.ctx.buffer(vdata.tobytes())
-        vao = self.ctx.vertex_array(
+        vbo_o = self.ctx.buffer(vdata_o.tobytes() if vdata_o.size > 0 else bytes(12))
+        vao_o = self.ctx.vertex_array(
             self.prog,
-            [(vbo, '3f 3f 4f 2f', 'in_pos', 'in_normal', 'in_color', 'in_uv')],
+            [(vbo_o, '3f 3f 4f 2f', 'in_pos', 'in_normal', 'in_color', 'in_uv')],
         )
-        self._vaos[k] = (vao, vbo, vdata.size // 12)
+        vbo_t = self.ctx.buffer(vdata_t.tobytes() if vdata_t.size > 0 else bytes(12))
+        vao_t = self.ctx.vertex_array(
+            self.prog,
+            [(vbo_t, '3f 3f 4f 2f', 'in_pos', 'in_normal', 'in_color', 'in_uv')],
+        )
+        self._vaos[k] = (vao_o, vbo_o, vdata_o.size // 12,
+                         vao_t, vbo_t, vdata_t.size // 12)
         ch.dirty = False
 
     def remove(self, k):
         if k in self._vaos:
-            self._vaos[k][0].release()
-            self._vaos[k][1].release()
+            entry = self._vaos[k]
+            entry[0].release(); entry[1].release()
+            if len(entry) > 3: entry[3].release(); entry[4].release()
             del self._vaos[k]
 
     def rebuild_all(self, world: World) -> None:
@@ -478,8 +465,25 @@ class Renderer:
             self.prog['u_tint'].value = (1.0, 1.0, 1.0)
 
         self.atlas.use(0);  self.prog['u_tex'].value = 0
-        for k2, (vao, vbo, nv) in self._vaos.items():
-            if nv > 0: vao.render(moderngl.TRIANGLES, vertices=nv)
+        # Pass 1: Opaque geometry – depth write ON
+        self.ctx.depth_func = '<'
+        for k2, entry in self._vaos.items():
+            nv = entry[2]
+            if nv > 0: entry[0].render(moderngl.TRIANGLES, vertices=nv)
+        # Pass 2: Transparent geometry (water, leaves)
+        # depth_mask=False: water doesn't write depth so layers blend through each other.
+        # Back-to-front sort ensures correct painter's algorithm blending.
+        self.ctx.enable(moderngl.BLEND)
+        self.ctx.depth_mask = False
+        px, pz = player.x, player.z
+        trans_chunks = [(k2, e) for k2, e in self._vaos.items()
+                        if len(e) > 3 and e[5] > 0]
+        trans_chunks.sort(
+            key=lambda t: -(t[0][0]*CHUNK_SIZE - px)**2 - (t[0][1]*CHUNK_SIZE - pz)**2
+        )
+        for k2, entry in trans_chunks:
+            entry[3].render(moderngl.TRIANGLES, vertices=entry[5])
+        self.ctx.depth_mask = True
 
         if ENABLE_WIREFRAME:
             self.ctx.wireframe  = True
@@ -756,50 +760,164 @@ class HotbarUI:
     def y_top(self): return self._y0+self._sz_val
 
 
+def _load_pyglet_img(path):
+    """Load a pyglet image, returning a 1×1 blank on failure."""
+    if path and os.path.exists(path):
+        try:
+            return pyglet.image.load(path)
+        except Exception:
+            pass
+    return pyglet.image.SolidColorImagePattern((0,0,0,0)).create_image(1,1)
+
+
 class StatusBarsUI:
-    def __init__(self,win,batch):
-        self._win=win; self._batch=batch; self._shapes=[]
-        self._hp=self._hg=self._xp=self._air=None
-        self._hp_w=self._hg_w=self._xp_w=self._air_w=0
+    """
+    HUD bars drawn as icon rows:
+      • Health  – up to 10 heart icons  (heart.png), right-aligned
+      • Hunger  – up to 10 chicken-leg bars, left-aligned  (kept as plain rects)
+      • XP      – thin green bar across full width
+      • Air     – up to 10 animated bubble icons above hearts, visible only underwater
+    """
+    N_ICONS  = 10          # hearts / bubbles shown at max
+    ANIM_FPS = 12.0        # bubble animation frame rate
+
+    def __init__(self, win, batch):
+        self._win   = win
+        self._batch = batch
+        self._shapes: list = []
+
+        # ── load textures once ────────────────────────────────────────────────
+        self._heart_img = _load_pyglet_img(HEART_TEX)
+        self._bubble_imgs = [_load_pyglet_img(p) for p in BUBBLE_FRAMES]
+        self._bubble_frame = 0.0   # float accumulator for animation
+
+        # sprite lists – rebuilt on resize
+        self._heart_sprites:  list[pyglet.sprite.Sprite] = []
+        self._bubble_sprites: list[pyglet.sprite.Sprite] = []
+
+        # plain-rect sub-bars (XP, hunger)
+        self._xp  = None; self._xp_w  = 0
+        self._hg  = None; self._hg_w  = 0
+
         self._rebuild()
+
+    # ── layout helpers ────────────────────────────────────────────────────────
+    def _sz(self):
+        return int(HotbarUI.SZ_BASE * _ui_scale(self._win))
+
+    def _layout(self):
+        """Return (tw, x0, bar_y, icon_sz) for current window size."""
+        sz  = self._sz()
+        n   = HotbarUI.N
+        gap = HotbarUI.GAP
+        tw  = n * sz + (n - 1) * gap
+        x0  = (self._win.width - tw) // 2
+        xp_y  = 8 + sz + 8
+        bar_y = xp_y + 9 + 5      # just above XP bar
+        icon_sz = max(10, sz // 3)
+        return tw, x0, bar_y, icon_sz
+
     def _rebuild(self):
-        for s in self._shapes: s.delete()
+        # delete old shapes and sprites
+        for s in self._shapes:
+            s.delete()
         self._shapes.clear()
-        sz=int(HotbarUI.SZ_BASE*_ui_scale(self._win)); gap=HotbarUI.GAP; n=HotbarUI.N
-        tw=n*sz+(n-1)*gap; x0=(self._win.width-tw)//2
-        xp_y=8+sz+8
-        xp_bg=pyglet.shapes.Rectangle(x0,xp_y,tw,5,color=(55,55,55),batch=self._batch)
-        xp_fg=pyglet.shapes.Rectangle(x0,xp_y,0, 5,color=(100,220,40),batch=self._batch)
-        self._shapes+=[xp_bg,xp_fg]; self._xp=xp_fg; self._xp_w=tw
-        bar_y=xp_y+9; hw=tw//2-2
-        hg_bg=pyglet.shapes.Rectangle(x0,      bar_y,hw,8,color=(50,50,50),batch=self._batch)
-        hg_fg=pyglet.shapes.Rectangle(x0,      bar_y,0, 8,color=(220,140,30),batch=self._batch)
-        hp_bg=pyglet.shapes.Rectangle(x0+tw-hw,bar_y,hw,8,color=(50,50,50),batch=self._batch)
-        hp_fg=pyglet.shapes.Rectangle(x0+tw-hw,bar_y,0, 8,color=(220,50,50),batch=self._batch)
-        self._shapes+=[hg_bg,hg_fg,hp_bg,hp_fg]
-        self._hg=hg_fg; self._hg_w=hw; self._hp=hp_fg; self._hp_w=hw
-        # Air bubble bar – shown only when underwater; sits above health bar
-        air_y=bar_y+12
-        air_bg=pyglet.shapes.Rectangle(x0+tw-hw,air_y,hw,6,color=(20,20,60),batch=self._batch)
-        air_fg=pyglet.shapes.Rectangle(x0+tw-hw,air_y,0, 6,color=(80,200,255),batch=self._batch)
-        self._shapes+=[air_bg,air_fg]
-        self._air=air_fg; self._air_w=hw
-        air_bg.visible=False; air_fg.visible=False
-        self._air_bg=air_bg
-    def update(self,player):
-        if not player: return
-        self._hp.width=int(self._hp_w*player.health/player.max_health)
-        self._hg.width=int(self._hg_w*player.hunger/player.max_hunger)
-        self._xp.width=int(self._xp_w*(player.xp%100)/100.)
-        # Show air bubble bar only when submerged
-        AIR_MAX = 10.0  # must match player.AIR_MAX
+        for sp in self._heart_sprites + self._bubble_sprites:
+            sp.delete()
+        self._heart_sprites.clear()
+        self._bubble_sprites.clear()
+
+        tw, x0, bar_y, icon_sz = self._layout()
+
+        # XP bar (full width, thin)
+        xp_y = 8 + self._sz() + 8
+        xp_bg = pyglet.shapes.Rectangle(x0, xp_y, tw, 5,
+                                         color=(55,55,55), batch=self._batch)
+        xp_fg = pyglet.shapes.Rectangle(x0, xp_y, 0,  5,
+                                         color=(100,220,40), batch=self._batch)
+        self._shapes += [xp_bg, xp_fg]
+        self._xp = xp_fg; self._xp_w = tw
+
+        # Hunger bar – left half, plain orange rectangles (no icon yet)
+        hw = tw // 2 - 2
+        hg_bg = pyglet.shapes.Rectangle(x0, bar_y, hw, 8,
+                                         color=(50,50,50), batch=self._batch)
+        hg_fg = pyglet.shapes.Rectangle(x0, bar_y, 0,  8,
+                                         color=(220,140,30), batch=self._batch)
+        self._shapes += [hg_bg, hg_fg]
+        self._hg = hg_fg; self._hg_w = hw
+
+        # ── Heart sprites – right half ────────────────────────────────────────
+        gap_i = max(1, icon_sz // 6)
+        heart_x0 = x0 + tw - self.N_ICONS * (icon_sz + gap_i) + gap_i
+        for i in range(self.N_ICONS):
+            sx = heart_x0 + i * (icon_sz + gap_i)
+            sp = pyglet.sprite.Sprite(self._heart_img,
+                                       x=sx, y=bar_y, batch=self._batch)
+            sp.scale = icon_sz / max(self._heart_img.width,
+                                     self._heart_img.height, 1)
+            sp.visible = True
+            self._heart_sprites.append(sp)
+
+        # ── Bubble sprites – same width as hearts, one row above ─────────────
+        bubble_y = bar_y + icon_sz + 3
+        first_img = self._bubble_imgs[0] if self._bubble_imgs else self._heart_img
+        for i in range(self.N_ICONS):
+            sx = heart_x0 + i * (icon_sz + gap_i)
+            sp = pyglet.sprite.Sprite(first_img,
+                                       x=sx, y=bubble_y, batch=self._batch)
+            sp.scale = icon_sz / max(first_img.width, first_img.height, 1)
+            sp.visible = False
+            self._bubble_sprites.append(sp)
+
+    # ── update every frame ────────────────────────────────────────────────────
+    def update(self, player, dt: float = 0.0):
+        if not player:
+            return
+
+        # XP / hunger plain bars
+        self._xp.width = int(self._xp_w * (player.xp % 100) / 100.)
+        self._hg.width = int(self._hg_w * player.hunger / player.max_hunger)
+
+        # ── Hearts: show filled/empty based on health ─────────────────────────
+        hp_frac   = player.health / player.max_health   # 0.0 – 1.0
+        filled    = hp_frac * self.N_ICONS              # how many full hearts
+        for i, sp in enumerate(self._heart_sprites):
+            # alpha: full heart = 255, empty heart = 60 (still visible, just dim)
+            if i < int(filled):
+                sp.opacity = 255
+            elif i < math.ceil(filled):
+                # partial heart – fade proportionally
+                sp.opacity = max(60, int((filled - int(filled)) * 255))
+            else:
+                sp.opacity = 60
+            sp.visible = True
+
+        # ── Bubble animation + visibility ────────────────────────────────────
+        AIR_MAX  = 10.0
         show_air = getattr(player, 'head_in_water', False)
-        self._air_bg.visible = show_air
-        self._air.visible    = show_air
-        if show_air:
-            air_frac = getattr(player, 'air', AIR_MAX) / AIR_MAX
-            self._air.width = int(self._air_w * air_frac)
-    def resize(self): self._rebuild()
+        air_frac = getattr(player, 'air', AIR_MAX) / AIR_MAX  # 0–1
+
+        if show_air and self._bubble_imgs:
+            # advance animation frame
+            self._bubble_frame = (self._bubble_frame + self.ANIM_FPS * dt) % len(self._bubble_imgs)
+            frame_img = self._bubble_imgs[int(self._bubble_frame)]
+            filled_bubbles = air_frac * self.N_ICONS
+            for i, sp in enumerate(self._bubble_sprites):
+                sp.image   = frame_img
+                sp.visible = True
+                if i < int(filled_bubbles):
+                    sp.opacity = 255
+                elif i < math.ceil(filled_bubbles):
+                    sp.opacity = max(40, int((filled_bubbles - int(filled_bubbles)) * 255))
+                else:
+                    sp.opacity = 30   # ghost bubble: nearly invisible
+        else:
+            for sp in self._bubble_sprites:
+                sp.visible = False
+
+    def resize(self):
+        self._rebuild()
 
 
 class InventoryScreen:
@@ -1222,7 +1340,7 @@ class UIManager:
         if self._mode==self.NONE: self.open_inv()
         else: self.close()
     def tick(self,dt): self._fur_scr.tick(dt,self._win.inventory)
-    def update_hud(self,player,world,fps_buf):
+    def update_hud(self,player,world,fps_buf,dt=0.0):
         fps=sum(fps_buf)/len(fps_buf) if fps_buf else 0
         inv=self._win.inventory; sel=inv.slots.selected_item or '—'
         bid=int(_biome_at(int(player.x),int(player.z),SEED))
@@ -1246,7 +1364,7 @@ class UIManager:
         else:
             hint=f"[{sel}]  WASD  Space=jump  LMB=mine  RMB=place  1-9=slot  F=eat  E=inv"
         self._l4.text=hint
-        self._bars.update(player); self._hotbar.refresh(inv)
+        self._bars.update(player, dt); self._hotbar.refresh(inv)
     def draw(self):
         self._hb.draw()
         if   self._mode==self.INV:     self._inv_scr.draw()
@@ -1541,7 +1659,7 @@ class GameWindow(pyglet.window.Window):
         self.mob_manager.update_mobs(dt, player_mob_pos, self.world,
                                      self.player, self.world.time_of_day)
         self._stream()
-        self._ui.update_hud(self.player, self.world, self._fps_buf)
+        self._ui.update_hud(self.player, self.world, self._fps_buf, dt)
 
     def on_draw(self):
         self.ren.draw(self.player, self.world, self.width, self.height)

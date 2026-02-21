@@ -261,9 +261,4 @@ RECIPES = {
 #  LEGACY CLASS SHIM  (main.py imports PlayerInventorySystem from here)
 # ═══════════════════════════════════════════════════════════════════════
 class PlayerInventorySystem:
-    """
-    Minimal compatibility shim.  The actual inventory logic lives in the
-    SlotInventory / Inventory classes inside main.py to avoid circular
-    imports; this class is only imported by name so main.py doesn't crash.
-    """
     pass

@@ -3,8 +3,16 @@ BLOCK TEXTURES MODULE  –  v3  (ocean biome edition)
 Defines all block types and their visual / gameplay properties.
 """
 
-TEX_BASE = "textures/assets/minecraft/textures/block"
-TEX_GUI = "textures/assets/minecraft/textures/paricle"
+TEX_BASE     = "textures/assets/minecraft/textures/block"
+PARTICLE_BASE = "textures/assets/minecraft/textures/particle"
+
+# HUD icon paths
+HEART_TEX    = f"{PARTICLE_BASE}/heart.png"
+BUBBLE_FRAMES = (
+    [f"{PARTICLE_BASE}/bubble.png"] +
+    [f"{PARTICLE_BASE}/bubble_{i}.png" for i in range(1, 7)]
+)
+
 class _Color:
     @staticmethod
     def rgb(r, g, b):       return (r, g, b)
@@ -18,8 +26,6 @@ class _Color:
 color = _Color()
 
 class BlockType:
-    HEART          = "heart"
-    BREATH         = "breath"
     AIR            = "air"
     GRASS          = "grass"
     DIRT           = "dirt"
@@ -62,27 +68,12 @@ class BlockType:
     PRISMARINE     = "prismarine"
 
 
-
-
 BLOCK_DATA = {
 
     BlockType.AIR: {
         "color": color.rgba(0, 0, 0, 0),
         "solid": False,
         "drops": None,
-    },
-
-    BlockType.HEART: {
-        "color":         color.rgb(255, 0, 0),
-        "texture":  f"{TEX_GUI}/heart.png",
-        # "texture_half":  f"{TEX_GUI}/heart_half.png",
-        # "texture_empty": f"{TEX_GUI}/heart_empty.png",
-        "solid": False, 
-    },
-    BlockType.BREATH: {
-        "color":         color.rgb(0, 190, 255),
-        "texture":  f"{TEX_GUI}/bubble.png",
-        "solid": False,
     },
 
     BlockType.GRASS: {
@@ -216,12 +207,12 @@ BLOCK_DATA = {
     BlockType.LAPIS_ORE:    {"color": color.rgb(60,80,180),  "texture": f"{TEX_BASE}/lapis_ore.png",    "solid": True, "drops": "lapis"},
 
     BlockType.WATER: {
-        "color":       color.rgba(55, 100, 200, 160),
+        "color":       color.rgba(55, 100, 200, 180),
         "texture":     f"{TEX_BASE}/water_still.png",
         "solid":       False, "transparent": True, "drops": None,
     },
     BlockType.GLASS: {
-        "color":       color.rgba(180, 220, 240, 120),
+        "color":       color.rgba(180, 220, 240, 100),
         "texture":     f"{TEX_BASE}/glass.png",
         "solid":       True, "transparent": True, "drops": None,
     },
@@ -281,4 +272,3 @@ BLOCK_DATA = {
         "solid":   True, "drops": BlockType.PRISMARINE,
     },
 }
-

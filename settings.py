@@ -38,19 +38,18 @@ USE_TEXTURES     = True
 USE_GREEDY_MESH  = False
 SHOW_ALL_FACES   = True
 USE_WATER        = True          # ← ocean enabled
-WATER_GRAVITY_SCALE   = 0.18   # fraction of normal gravity while submerged
-WATER_HORIZ_DRAG      = 0.82   # per-frame velocity multiplier (< 1 = drag)
-WATER_VERT_DRAG       = 0.78   # tighter vertical drag than horizontal
-WATER_SINK_CAP        = -2.5   # terminal velocity while sinking in water
-WATER_RISE_CAP        =  2.5   # max upward speed while swimming
-WATER_SWIM_FORCE      =  6.0   # upward impulse when pressing SPACE underwater
-WATER_SURFACE_JUMP    =  7.5   # jump velocity when exiting water from surface
-AIR_MAX               = 20.0   # seconds of air (= 10 "bubbles")
-DROWN_DAMAGE_RATE     =  1.0   # HP per second when air is empty
-BUOYANCY_STRENGTH     =  9.0   # upward force when fully submerged (blocks/s²)
 
-
-
+# ── Water physics ─────────────────────────────────────────────────────────────
+WATER_GRAVITY_SCALE  = 0.18   # fraction of normal gravity while submerged
+WATER_HORIZ_DRAG     = 0.82   # per-frame velocity multiplier
+WATER_VERT_DRAG      = 0.78   # tighter vertical drag than horizontal
+WATER_SINK_CAP       = -2.5   # terminal velocity while sinking in water
+WATER_RISE_CAP       =  2.5   # max upward speed while swimming
+WATER_SWIM_FORCE     =  6.0   # upward impulse when pressing SPACE underwater
+WATER_SURFACE_JUMP   =  7.5   # jump velocity when exiting water from surface
+AIR_MAX              = 10.0   # seconds of air (= 10 "bubbles")
+DROWN_DAMAGE_RATE    =  1.0   # HP per second when air is empty
+BUOYANCY_STRENGTH    =  9.0   # upward force when fully submerged (blocks/s²)
 
 # ═══════════════════════════════════════════════════════════════════════
 #  BLOCK-TYPE REGISTRY  (index == integer stored in chunk arrays)
@@ -96,6 +95,7 @@ N_BLOCK_TYPES = len(_BT_LIST)
 # ── Per-type property arrays (uint8) ────────────────────────────────────────
 BT_SOLID  = np.zeros(N_BLOCK_TYPES, dtype=np.uint8)
 BT_TRANS  = np.zeros(N_BLOCK_TYPES, dtype=np.uint8)
+BT_LIQUID = np.zeros(N_BLOCK_TYPES, dtype=np.uint8)  # only water-type blocks
 BT_RENDER = np.zeros(N_BLOCK_TYPES, dtype=np.uint8)
 BT_ROT    = np.zeros((N_BLOCK_TYPES, 6), dtype=np.int8)
 
@@ -103,6 +103,7 @@ for _i, _bt in enumerate(_BT_LIST):
     _props = BLOCK_DATA.get(_bt, {})
     BT_SOLID[_i]  = 1 if (_props.get("solid", True) and _bt != BlockType.AIR) else 0
     BT_TRANS[_i]  = 1 if _props.get("transparent", False) else 0
+    BT_LIQUID[_i] = 1 if _bt == BlockType.WATER else 0
     BT_RENDER[_i] = 1 if (_bt != BlockType.AIR and (BT_SOLID[_i] or BT_TRANS[_i])) else 0
     _faces = _props.get("rotate_side_faces")
     if _faces:
@@ -269,9 +270,10 @@ def _make_face_colors():
         else:
             a = 1.0
 
-        # TRANSPARENCY FIX: textured transparent blocks (leaves, cactus, kelp)
-        # use alpha=1.0 so the texture's own alpha channel drives cutout rendering.
-        if is_trans and has_tex:
+        # Cutout blocks (leaves, cactus) have 3-component colors — force a=1.0
+        # so texture alpha channel drives the cutout. Liquid blocks (water) have
+        # a 4-component color with explicit alpha — respect it for transparency.
+        if is_trans and has_tex and len(c) < 4:
             a = 1.0
 
         for f, shade in enumerate(_FACE_SHADE):
