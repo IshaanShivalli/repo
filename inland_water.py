@@ -14,8 +14,7 @@ from numba import njit
 from settings import SEA_LEVEL, BEDROCK_LEVEL, CHUNK_HEIGHT
 
 # River water surface — just below sea level so oceans don't bleed in
-RIVER_Y = SEA_LEVEL - 1
-
+RIVER_Y = SEA_LEVEL - 0.2
 
 # ── Gradient noise (Perlin-style) ─────────────────────────────────────────────
 
@@ -67,7 +66,7 @@ def river_info(wx: int, wz: int, height: int, seed: int) -> int:
     already below RIVER_Y are skipped (no floating water possible).
     """
     FREQ = 0.010  # noise frequency — lower = fewer rivers, wider spacing
-    BAND = 0.050  # zero-crossing band width — slightly narrower rivers
+    BAND = 0.030  # zero-crossing band width — narrower rivers
 
     v = _grad_noise(float(wx) * FREQ, float(wz) * FREQ * 0.8, seed ^ 0x52AB)
 

@@ -535,8 +535,6 @@ class MobRenderer:
                     scale = 64 // img.width
                     img = img.resize((img.width * scale, img.height * scale),
                                      resample=Image.NEAREST)
-                # Flip vertically: PIL is top-left origin, OpenGL is bottom-left
-                img = img.transpose(Image.FLIP_TOP_BOTTOM)
                 tex = self._ctx.texture(img.size, 4, img.tobytes())
                 tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
                 self._textures[mob_type] = tex

@@ -220,6 +220,19 @@ class Player:
                             return True
             return False
 
+        def has_support(px: float, py: float, pz: float) -> bool:
+            """True if there's solid ground directly under any foot corner."""
+            y = py - 0.05
+            for bx in (px - W, px + W):
+                for bz in (pz - W, pz + W):
+                    bt = world.get_block(
+                        int(math.floor(bx)),
+                        int(math.floor(y)),
+                        int(math.floor(bz)))
+                    if bt and bt < N_BLOCK_TYPES and BT_SOLID[bt]:
+                        return True
+            return False
+
         def touch_cactus(px: float, py: float, pz: float) -> bool:
             for bx in (px - W, px + W):
                 for bz in (pz - W, pz + W):
@@ -238,11 +251,17 @@ class Player:
         self.x += self.vx * dt
         if hit(self.x, self.y, self.z):
             self.x -= self.vx * dt;  self.vx = 0.0
+        elif self.crouching and self.on_ground and not self.in_water:
+            if not has_support(self.x, self.y, self.z):
+                self.x -= self.vx * dt;  self.vx = 0.0
 
         # Z axis
         self.z += self.vz * dt
         if hit(self.x, self.y, self.z):
             self.z -= self.vz * dt;  self.vz = 0.0
+        elif self.crouching and self.on_ground and not self.in_water:
+            if not has_support(self.x, self.y, self.z):
+                self.z -= self.vz * dt;  self.vz = 0.0
 
         # Y axis
         prev_vy   = self.vy
