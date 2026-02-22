@@ -495,6 +495,7 @@ class MobRenderer:
         self._ctx  = None
         self._prog = None
         self._textures: dict[str, moderngl.Texture] = {}
+        self._tex_sizes: dict[str, tuple[int, int]] = {}
         self._vbo  = None
         self._vao  = None
 
@@ -520,6 +521,7 @@ class MobRenderer:
                 data.extend(col)
         tex = self._ctx.texture((sz, sz), 4, bytes(data))
         tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        self._tex_sizes[mob_type] = (sz, sz)
         return tex
 
     def _load_tex(self, mob_type: str) -> None:
@@ -538,6 +540,7 @@ class MobRenderer:
                 tex = self._ctx.texture(img.size, 4, img.tobytes())
                 tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
                 self._textures[mob_type] = tex
+                self._tex_sizes[mob_type] = img.size
                 print(f"[Mobs3D] ✔ {mob_type}: {path}  ({img.size})")
                 return
             except Exception as exc:
@@ -548,7 +551,7 @@ class MobRenderer:
     # ── build & upload vertex data for a single mob ───────────────────────────
     def _build_mob_verts(self, mob: Mob) -> np.ndarray:
         parts   = _PARTS.get(mob.type, [])
-        sw, sh  = _SHEET.get(mob.type, (64, 32))
+        sw, sh  = self._tex_sizes.get(mob.type, _SHEET.get(mob.type, (64, 32)))
         yaw_rad = math.radians(mob.yaw)
 
         verts = []
