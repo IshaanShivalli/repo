@@ -34,6 +34,7 @@ from settings import (
     MOUSE_SENS, FOV, WIN_W, WIN_H,
     ENABLE_WIREFRAME, EDGE_COLOR, EDGE_WIDTH,
     TILE_SIZE, USE_TEXTURES, USE_GREEDY_MESH, SHOW_ALL_FACES, USE_WATER,
+    WATER_MAX_OPS, WATER_TICK_INTERVAL,
     AIR, _BT_LIST, BT, N_BLOCK_TYPES,
     BT_SOLID, BT_TRANS, BT_LIQUID, BT_RENDER, BT_ROT,
     BT_OCCLUDE,          # ← the fixed occlusion mask (solid AND opaque)
@@ -78,6 +79,48 @@ void main() {
     frag_color  = vec4(rgb * u_tint * light, v_color.a * texel.a);
 }"""
 
+WATER_VERT = """
+#version 330 core
+in vec3 in_pos; in vec3 in_normal; in vec4 in_color; in vec2 in_uv;
+uniform mat4 u_mvp;
+uniform float u_time;
+out vec4 v_color; out vec3 v_normal; out vec2 v_uv; out float v_flow; out float v_is_water;
+void main() {
+    gl_Position = u_mvp * vec4(in_pos, 1.0);
+    v_color  = in_color;
+    v_normal = in_normal;
+    // Flow direction: scroll UV downhill (negative Y in texture = downstream)
+    // Use world XZ position to determine flow direction per-vertex
+    float flow_speed = 0.18;
+    v_is_water = step(0.5, v_color.b - max(v_color.r, v_color.g) + 0.5);
+    v_uv = in_uv + vec2(0.0, u_time * flow_speed * v_is_water);
+    v_flow = u_time * v_is_water;
+}
+"""
+
+WATER_FRAG = """
+#version 330 core
+in vec4 v_color; in vec3 v_normal; in vec2 v_uv; in float v_flow; in float v_is_water;
+uniform vec3 u_sun; uniform float u_ambient; uniform vec3 u_tint;
+uniform sampler2D u_tex;
+out vec4 frag_color;
+void main() {
+    vec3 norm = normalize(v_normal);
+
+    vec2 uv1 = v_uv;
+    vec2 uv2 = v_uv * 1.3 + vec2(v_flow * 0.11, -v_flow * 0.07);
+    vec4 t1 = texture(u_tex, uv1);
+    // Only do double-sample animation for water faces
+    vec4 t2 = texture(u_tex, uv2);
+    vec4 texel = mix(t1, mix(t1, t2, 0.45 * v_is_water), v_is_water);
+    if (texel.a < 0.05) discard;
+    float diff  = max(dot(norm, normalize(u_sun)), 0.0);
+    float light = u_ambient + (1.0 - u_ambient) * diff;
+    vec3 rgb    = texel.rgb * v_color.rgb;
+    frag_color  = vec4(rgb * u_tint * light, v_color.a * texel.a);
+}
+"""
+
 SKY_VERT = """
 #version 330 core
 in vec2 in_pos; out float v_y; out vec2 v_pos;
@@ -88,6 +131,48 @@ SKY_FRAG = """
 in float v_y; in vec2 v_pos; out vec4 frag_color;
 uniform vec3 u_top; uniform vec3 u_bot;
 void main() { frag_color=vec4(mix(u_bot,u_top,v_y),1.0); }"""
+
+
+CLOUD_VERT = """
+#version 330 core
+in vec3 in_pos;
+uniform mat4 u_mvp;
+out vec3 v_world;
+void main() {
+    v_world = in_pos;
+    gl_Position = u_mvp * vec4(in_pos, 1.0);
+}
+"""
+
+CLOUD_FRAG = """
+#version 330 core
+in vec3 v_world;
+uniform float u_time;
+uniform vec3  u_sky_col;
+out vec4 frag_color;
+
+float hash(vec2 p) {
+    p = fract(p * vec2(127.1, 311.7));
+    p += dot(p, p + 19.19);
+    return fract(p.x * p.y);
+}
+float noise(vec2 p) {
+    vec2 i = floor(p); vec2 f = fract(p);
+    f = f*f*(3.0-2.0*f);
+    return mix(mix(hash(i),hash(i+vec2(1,0)),f.x),
+               mix(hash(i+vec2(0,1)),hash(i+vec2(1,1)),f.x),f.y);
+}
+float fbm(vec2 p) {
+    return noise(p)*0.5 + noise(p*2.1)*0.25 + noise(p*4.3)*0.125;
+}
+void main() {
+    vec2 uv = (v_world.xz + u_time * 12.0) * 0.004;
+    float c = fbm(uv);
+    float alpha = smoothstep(0.52, 0.70, c) * 0.88;
+    vec3 cloud_col = mix(u_sky_col, vec3(1.0), 0.85);
+    frag_color = vec4(cloud_col, alpha);
+}
+"""
 
 SUN_VERT = """
 #version 330 core
@@ -149,6 +234,15 @@ class World:
                     nb.dirty = True
                     if nb not in self.dirty_queue:
                         self.dirty_queue.appendleft(nb)
+            # Seed water flow for newly generated chunks so water can spread
+            ID_WATER = BT.get(BlockType.WATER, 0)
+            if ID_WATER:
+                water_cells = np.argwhere(blk == ID_WATER)
+                if water_cells.size:
+                    ox = cx * CHUNK_SIZE
+                    oz = cz * CHUNK_SIZE
+                    for lx, ly, lz in water_cells:
+                        self.schedule_water(int(ox + lx), int(ly), int(oz + lz))
         return self.chunks[k]
 
     def get_block(self, wx, wy, wz):
@@ -223,7 +317,7 @@ class World:
                 self._water_scheduled.add(pos)
                 self._water_queue.append(pos)
 
-    def _water_tick(self, max_ops: int = 64):
+    def _water_tick(self, max_ops: int = WATER_MAX_OPS):
         """Process up to max_ops water-flow steps."""
         self._init_water()
         ID_WATER = BT.get(BlockType.WATER, 0)
@@ -248,18 +342,23 @@ class World:
                 self.schedule_water(wx, wy - 1, wz)
                 continue  # downward flow takes priority – skip horizontal
 
-            # Spread horizontally only into cells with a solid floor below
+            # Spread horizontally into open cells (even if they drop after)
             for nx, nz in ((wx-1,wz),(wx+1,wz),(wx,wz-1),(wx,wz+1)):
                 nb_bt = self.get_block(nx, wy, nz)
                 if nb_bt == 0:
-                    below_nb = self.get_block(nx, wy - 1, nz)
-                    if below_nb != 0:
-                        self.set_block(nx, wy, nz, ID_WATER)
-                        self.schedule_water(nx, wy, nz)
+                    # Allow flow even if below is empty; it will fall next ticks.
+                    self.set_block(nx, wy, nz, ID_WATER)
+                    self.schedule_water(nx, wy, nz)
 
     def tick(self, dt):
         self.time_of_day = (self.time_of_day + DAY_TICK_SPEED * dt) % 24000.0
-        self._water_tick()
+        # Run water simulation at a fixed, slower cadence
+        if not hasattr(self, "_water_accum"):
+            self._water_accum = 0.0
+        self._water_accum += dt
+        while self._water_accum >= WATER_TICK_INTERVAL:
+            self._water_tick(WATER_MAX_OPS)
+            self._water_accum -= WATER_TICK_INTERVAL
 
     def sky(self):
         t = self.time_of_day
@@ -296,7 +395,10 @@ class Renderer:
     def __init__(self, ctx):
         self.ctx  = ctx
         self.prog = ctx.program(vertex_shader=VERT_GLSL, fragment_shader=FRAG_GLSL)
-        self.skyp = ctx.program(vertex_shader=SKY_VERT,  fragment_shader=SKY_FRAG)
+        self.skyp  = ctx.program(vertex_shader=SKY_VERT,  fragment_shader=SKY_FRAG)
+        self.cloudp = ctx.program(vertex_shader=CLOUD_VERT, fragment_shader=CLOUD_FRAG)
+        self.waterp = ctx.program(vertex_shader=WATER_VERT, fragment_shader=WATER_FRAG)
+        self.water_time = 0.0
         self.sunp = ctx.program(vertex_shader=SUN_VERT,  fragment_shader=SUN_FRAG)
         self.atlas = ctx.texture(_atlas_img.size, 4, _atlas_img.tobytes())
         self.atlas.filter    = (moderngl.NEAREST, moderngl.NEAREST)
@@ -305,6 +407,14 @@ class Renderer:
         quad    = np.array([-1,-1,1,-1,-1,1,1,1], dtype=np.float32)
         sky_vbo = ctx.buffer(quad.tobytes())
         self.sky_vao = ctx.vertex_array(self.skyp, [(sky_vbo, '2f', 'in_pos')])
+        # Cloud quad mesh (large flat plane at cloud height)
+        CLOUD_Y = float(SEA_LEVEL + 80)
+        CLOUD_R = 400.0
+        cq = np.array([-CLOUD_R,CLOUD_Y,-CLOUD_R, CLOUD_R,CLOUD_Y,-CLOUD_R,
+                        CLOUD_R,CLOUD_Y, CLOUD_R,-CLOUD_R,CLOUD_Y, CLOUD_R], dtype=np.float32)
+        self.cloud_vbo = ctx.buffer(cq.tobytes())
+        self.cloud_vao = ctx.vertex_array(self.cloudp, [(self.cloud_vbo,"3f","in_pos")])
+        self.cloud_time = 0.0
 
         sun_img = _load_image_rgba(sun_moon.SUN_TEX)
         self.sun_tex = ctx.texture(sun_img.size, 4, sun_img.tobytes()) if sun_img else None
@@ -337,6 +447,8 @@ class Renderer:
         if k in self._vaos:
             self._vaos[k][0].release()
             self._vaos[k][1].release()
+            if len(self._vaos[k]) > 6:
+                self._vaos[k][6].release()  # water VAO
             del self._vaos[k]
 
         S = CHUNK_SIZE;  H = CHUNK_HEIGHT
@@ -375,8 +487,13 @@ class Renderer:
             self.prog,
             [(vbo_t, '3f 3f 4f 2f', 'in_pos', 'in_normal', 'in_color', 'in_uv')],
         )
+        # Water VAO uses animated water shader
+        vao_w = self.ctx.vertex_array(
+            self.waterp,
+            [(vbo_t, '3f 3f 4f 2f', 'in_pos', 'in_normal', 'in_color', 'in_uv')],
+        )
         self._vaos[k] = (vao_o, vbo_o, vdata_o.size // 12,
-                         vao_t, vbo_t, vdata_t.size // 12)
+                         vao_t, vbo_t, vdata_t.size // 12, vao_w)
         ch.dirty = False
 
     def remove(self, k):
@@ -444,6 +561,30 @@ class Renderer:
                 mtex.use(0);  self.sunp['u_tex'].value = 0
                 self.moon_vao.render(moderngl.TRIANGLES)
 
+        # Clouds
+        self.cloud_time += 0.016
+        ex, ey, ez = player.eye()
+        proj_c = _persp(FOV, w/h, 0.05, 2000.)
+        view_c = player.view_mat()
+        mvp_c  = proj_c @ view_c
+        import ctypes
+        self.cloudp["u_mvp"].write(mvp_c.T.astype(np.float32).tobytes())
+        self.cloudp["u_time"].value = self.cloud_time
+        sky_col = list(bot)
+        self.cloudp["u_sky_col"].value = tuple(sky_col)
+        # Offset cloud plane to follow player XZ
+        CLOUD_Y = float(SEA_LEVEL + 80)
+        CLOUD_R = 400.0
+        cx2,cz2 = ex, ez
+        cq = np.array([cx2-CLOUD_R,CLOUD_Y,cz2-CLOUD_R, cx2+CLOUD_R,CLOUD_Y,cz2-CLOUD_R,
+                        cx2+CLOUD_R,CLOUD_Y,cz2+CLOUD_R, cx2-CLOUD_R,CLOUD_Y,cz2+CLOUD_R], dtype=np.float32)
+        self.cloud_vbo.write(cq.tobytes())
+        self.ctx.enable(moderngl.BLEND)
+        self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+        self.ctx.disable(moderngl.CULL_FACE)
+        self.cloud_vao.render(moderngl.TRIANGLE_FAN)
+        self.ctx.disable(moderngl.BLEND)
+
         # World chunks
         if SHOW_ALL_FACES: self.ctx.disable(moderngl.CULL_FACE)
         else:              self.ctx.enable(moderngl.CULL_FACE)
@@ -481,8 +622,21 @@ class Renderer:
         trans_chunks.sort(
             key=lambda t: -(t[0][0]*CHUNK_SIZE - px)**2 - (t[0][1]*CHUNK_SIZE - pz)**2
         )
+        # Set water shader uniforms once
+        self.water_time += 0.016
+        self.atlas.use(0)  # ensure atlas bound for water shader
+        self.waterp['u_mvp'].write(mvp.T.astype(np.float32).tobytes())
+        self.waterp['u_time'].value    = self.water_time
+        self.waterp['u_sun'].value     = self.prog['u_sun'].value
+        self.waterp['u_ambient'].value  = self.prog['u_ambient'].value
+        self.waterp['u_tint'].value    = self.prog['u_tint'].value
+        self.waterp['u_tex'].value     = 0
         for k2, entry in trans_chunks:
-            entry[3].render(moderngl.TRIANGLES, vertices=entry[5])
+            # Use animated water VAO if available, else fallback
+            if len(entry) > 6 and entry[5] > 0:
+                entry[6].render(moderngl.TRIANGLES, vertices=entry[5])
+            elif entry[5] > 0:
+                entry[3].render(moderngl.TRIANGLES, vertices=entry[5])
         self.ctx.depth_mask = True
 
         if ENABLE_WIREFRAME:
@@ -567,6 +721,7 @@ class SlotInventory:
         return s[1] if s else 0
 
     def add(self, item, count=1):
+        # First: stack onto existing slots anywhere
         for i in range(self.SIZE):
             if count <= 0: break
             s = self._slots[i]
@@ -574,7 +729,15 @@ class SlotInventory:
                 can = min(count, MAX_STACK - s[1])
                 self._slots[i] = (item, s[1] + can)
                 count -= can
-        for i in range(self.SIZE):
+        # Second: fill empty hotbar slots first (27-35)
+        for i in range(self.MAIN_SIZE, self.SIZE):
+            if count <= 0: break
+            if self._slots[i] is None:
+                take = min(count, MAX_STACK)
+                self._slots[i] = (item, take)
+                count -= take
+        # Third: overflow into main inventory
+        for i in range(self.MAIN_SIZE):
             if count <= 0: break
             if self._slots[i] is None:
                 take = min(count, MAX_STACK)

@@ -33,7 +33,7 @@ WIN_W, WIN_H     = 1280, 720
 ENABLE_WIREFRAME = False
 EDGE_COLOR       = (0.08, 0.12, 0.08)
 EDGE_WIDTH       = 2.5
-TILE_SIZE        = 16
+TILE_SIZE        = 32
 USE_TEXTURES     = True
 USE_GREEDY_MESH  = False
 SHOW_ALL_FACES   = True
@@ -49,7 +49,11 @@ WATER_SWIM_FORCE     =  6.0   # upward impulse when pressing SPACE underwater
 WATER_SURFACE_JUMP   =  7.5   # jump velocity when exiting water from surface
 AIR_MAX              = 10.0   # seconds of air (= 10 "bubbles")
 DROWN_DAMAGE_RATE    =  1.0   # HP per second when air is empty
-BUOYANCY_STRENGTH    =  9.0   # upward force when fully submerged (blocks/s²)
+BUOYANCY_STRENGTH    =  9.0   # upward force when fully submerged (blocks/sÂ²)
+
+# Water flow simulation (block spread)
+WATER_MAX_OPS        = 80     # max flow steps per tick (higher = faster)
+WATER_TICK_INTERVAL  = 0.04   # seconds between flow steps
 
 # ═══════════════════════════════════════════════════════════════════════
 #  BLOCK-TYPE REGISTRY  (index == integer stored in chunk arrays)
@@ -124,7 +128,12 @@ BT_OCCLUDE = (BT_SOLID & np.where(BT_TRANS, np.uint8(0), np.uint8(1))).astype(np
 def _load_image_rgba(path: str):
     try:
         img = Image.open(path).convert("RGBA")
-        if img.size != (TILE_SIZE, TILE_SIZE):
+        w, h = img.size
+        # If this is an animated strip (e.g., water/lava), keep only the first frame.
+        if h != w and h % w == 0:
+            img = img.crop((0, 0, w, w))
+            w = h = w
+        if (w, h) != (TILE_SIZE, TILE_SIZE):
             img = img.resize((TILE_SIZE, TILE_SIZE), resample=Image.NEAREST)
         return img
     except Exception:

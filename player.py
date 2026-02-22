@@ -1,15 +1,11 @@
 """
-player.py  –  Player entity: state, physics (including full water physics),
-              collision detection, raycasting.
+player.py  –  Player entity: state, physics, collision, raycasting.
 
-Water physics implemented:
-  - Buoyancy: upward force proportional to submersion depth
-  - Drag: horizontal and vertical velocity damped in water
-  - Swimming: SPACE near surface jumps out; SPACE submerged rises steadily
-  - Breathing: air bar (10 bubbles = 10 s), depletes underwater, refills on surface
-  - Drowning: 1 HP/s damage when air runs out
-  - Water entry/exit: suppresses fall damage
-  - Kelp / seagrass: non-solid, player moves through freely
+Water physics are handled by physics.py.
+Key changes vs previous version:
+  - No passive buoyancy – player sinks naturally, SPACE swims up
+  - Smooth breath-metre transitions (no flicker)
+  - Cave-water surface glitch fixed via tighter Y-collision guard
 """
 
 import math
@@ -19,30 +15,18 @@ from block_textures import BlockType
 from settings import (
     CHUNK_SIZE, CHUNK_HEIGHT, N_BLOCK_TYPES, _BT_LIST,
     BT_SOLID, EYE_OFFSET, PLAYER_HEIGHT, PLAYER_SPEED,
-    GRAVITY, JUMP_VEL, MOUSE_SENS, _lookat,AIR_MAX, DROWN_DAMAGE_RATE,WATER_GRAVITY_SCALE,
-    BUOYANCY_STRENGTH,WATER_SINK_CAP,WATER_RISE_CAP, WATER_HORIZ_DRAG,WATER_VERT_DRAG, WATER_SURFACE_JUMP,WATER_SWIM_FORCE,
+    GRAVITY, JUMP_VEL, MOUSE_SENS, _lookat,
+)
+from physics import (
+    AIR_MAX, probe_water, update_breathing, apply_water_physics,
+    block_is_water, block_is_swimmable,
 )
 from terrain import _terrain_height
 
 try:
     from pyglet.window import key
 except ImportError:
-    key = None   # allow import without display (unit tests etc.)
-
-# ── water tuning constants ────────────────────────────────────────────────────
-
-
-def _block_is_water(bt_id: int) -> bool:
-    return (0 < bt_id < N_BLOCK_TYPES and
-            _BT_LIST[bt_id] == BlockType.WATER)
-
-
-def _block_is_swimmable(bt_id: int) -> bool:
-    """Non-solid liquid/plant blocks the player swims through."""
-    if bt_id <= 0 or bt_id >= N_BLOCK_TYPES:
-        return False
-    name = _BT_LIST[bt_id]
-    return name in (BlockType.WATER, BlockType.KELP, BlockType.SEAGRASS)
+    key = None
 
 
 class Player:
@@ -51,23 +35,29 @@ class Player:
         self.vx = self.vy = self.vz = 0.0
         self.yaw   = 0.0
         self.pitch = 0.0
-        self.on_ground  = False
-        self.in_water   = False   # foot-level water
-        self.head_in_water = False  # eye-level water (breathing)
-        self.water_depth  = 0.0    # 0.0 = not in water, 1.0 = fully submerged
-        self.was_in_water = False   # for fall-damage suppression
-        self.air = AIR_MAX          # seconds of air remaining
-        self.health     = 20.0;  self.max_health  = 20.0
-        self.hunger     = 20.0;  self.max_hunger  = 20.0
-        self.saturation = 5.0
-        self.xp      = 0
-        self.level   = 0
+        self.on_ground     = False
+        self.in_water      = False
+        self.head_in_water = False
+        self.water_depth   = 0.0
+        self.was_in_water  = False
+        # Smooth breath bar – track a display value separately from raw air
+        self.air           = AIR_MAX
+        self.air_display   = AIR_MAX   # lerped value for HUD (no flicker)
+        self.health        = 20.0;  self.max_health  = 20.0
+        self.hunger        = 20.0;  self.max_hunger  = 20.0
+        self.saturation    = 5.0
+        self.xp            = 0
+        self.level         = 0
         self.inv_time      = 0.0
         self.void_time     = 0.0
         self.game_mode     = "survival"
         self.fall_dist     = 0.0
         self.regen_time    = 0.0
         self.death_msg_time = 0.0
+        self.sprinting     = False
+        self.crouching     = False
+        self.sprint_timer  = 0.0   # double-tap W detection
+        self.w_tap_time    = 0.0   # time of last W tap
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
@@ -80,7 +70,9 @@ class Player:
                 self.death_msg_time = 2.0
 
     def eye(self) -> tuple:
-        return self.x, self.y + EYE_OFFSET, self.z
+        # Crouch lowers eye height by 0.4 blocks
+        offset = EYE_OFFSET - 0.4 if self.crouching else EYE_OFFSET
+        return self.x, self.y + offset, self.z
 
     def forward(self) -> tuple:
         yr = math.radians(self.yaw)
@@ -95,38 +87,6 @@ class Player:
         fl = math.sqrt(fx*fx + fy*fy + fz*fz)
         fwd = np.array([fx/fl, fy/fl, fz/fl], dtype=np.float32)
         return _lookat(np.array([ex, ey, ez], np.float32), fwd)
-
-    # ── water probing ─────────────────────────────────────────────────────────
-
-    def _probe_water(self, world) -> tuple:
-        """
-        Returns (in_water, head_in_water, depth_fraction).
-        depth_fraction: 0=dry, 0.5=feet submerged, 1.0=fully under.
-        """
-        foot_y  = int(math.floor(self.y))
-        mid_y   = int(math.floor(self.y + PLAYER_HEIGHT * 0.5))
-        head_y  = int(math.floor(self.y + EYE_OFFSET))
-        ix      = int(math.floor(self.x))
-        iz      = int(math.floor(self.z))
-
-        foot_bt = world.get_block(ix, foot_y, iz)
-        mid_bt  = world.get_block(ix, mid_y,  iz)
-        head_bt = world.get_block(ix, head_y, iz)
-
-        foot_wet = _block_is_water(foot_bt)
-        mid_wet  = _block_is_water(mid_bt)
-        head_wet = _block_is_water(head_bt)
-
-        if head_wet:
-            depth = 1.0
-        elif mid_wet:
-            depth = 0.6
-        elif foot_wet:
-            depth = 0.3
-        else:
-            depth = 0.0
-
-        return foot_wet or mid_wet, head_wet, depth
 
     # ── update ────────────────────────────────────────────────────────────────
 
@@ -147,76 +107,83 @@ class Player:
             if self.health < self.max_health and self.hunger > 0:
                 self.regen_time += dt
                 if self.regen_time >= 1.0:
-                    self.health   = min(self.max_health, self.health + 1.0)
-                    self.hunger   = max(0.0, self.hunger - 0.5)
+                    self.health     = min(self.max_health, self.health + 1.0)
+                    self.hunger     = max(0.0, self.hunger - 0.5)
                     self.regen_time = 0.0
             else:
                 self.regen_time = 0.0
 
-        # Water state
-        self.in_water, self.head_in_water, self.water_depth = (
-            self._probe_water(world))
+        # Water state probe
+        self.in_water, self.head_in_water, self.water_depth = probe_water(
+            self.x, self.y, self.z,
+            PLAYER_HEIGHT, EYE_OFFSET,
+            world, N_BLOCK_TYPES, _BT_LIST,
+        )
 
-        # Breathing / drowning
-        if self.head_in_water:
-            self.air = max(0.0, self.air - dt)
-            if self.air <= 0 and self.game_mode == "survival":
-                self.take_damage(DROWN_DAMAGE_RATE * dt)
-        else:
-            # Refill air faster than depletion (1.5 s to full)
-            self.air = min(AIR_MAX, self.air + dt * (AIR_MAX / 1.5))
+        # Breathing (physics.py handles damage)
+        self.air = update_breathing(
+            self.air, self.head_in_water, dt,
+            self.game_mode, self.take_damage,
+        )
+
+        # Smooth display value – lerp toward real air quickly but not instantly
+        # This eliminates the single-frame flicker when crossing the surface.
+        LERP_SPEED = 8.0
+        self.air_display += (self.air - self.air_display) * min(1.0, LERP_SPEED * dt)
 
         # ── Movement direction ────────────────────────────────────────────────
-        yr  = math.radians(self.yaw)
-        fw  = (math.sin(yr), 0.0, math.cos(yr))
-        ri  = (-math.cos(yr), 0.0, math.sin(yr))
-        speed = PLAYER_SPEED * (0.6 if self.in_water else 1.0)
+        ctrl_pressed  = key and (key.LCTRL  in keys or key.RCTRL  in keys)
+        shift_key     = key and (key.LSHIFT in keys or key.RSHIFT in keys)
+        w_pressed     = key and key.W in keys
+
+        # Sprinting: hold Ctrl (or double-tap W) while moving forward
+        if ctrl_pressed and w_pressed and self.on_ground and not self.in_water:
+            self.sprinting = True
+        elif not w_pressed or self.in_water or not self.on_ground:
+            self.sprinting = False
+
+        # Crouching: hold Shift while on ground and not sprinting
+        if shift_key and self.on_ground and not self.in_water:
+            self.crouching = True
+            self.sprinting = False
+        else:
+            self.crouching = False
+
+        yr    = math.radians(self.yaw)
+        fw    = (math.sin(yr), 0.0, math.cos(yr))
+        ri    = (-math.cos(yr), 0.0, math.sin(yr))
+
+        if self.in_water:
+            speed = PLAYER_SPEED * 0.55
+        elif self.sprinting:
+            speed = PLAYER_SPEED * 1.6
+        elif self.crouching:
+            speed = PLAYER_SPEED * 0.3
+        else:
+            speed = PLAYER_SPEED
+
         self.vx = (fw[0]*mz + ri[0]*mx) * speed
         self.vz = (fw[2]*mz + ri[2]*mx) * speed
 
-        # ── Gravity & buoyancy ────────────────────────────────────────────────
+        # ── Gravity / water physics ───────────────────────────────────────────
+        space_pressed = key and key.SPACE in keys
+        shift_pressed = key and (key.LSHIFT in keys or key.RSHIFT in keys)  # swim down in water
+
         if self.in_water:
-            # Reduced gravity
-            grav = GRAVITY * WATER_GRAVITY_SCALE
-            self.vy -= grav * dt
-
-            # Buoyancy: push upward proportional to submersion
-            buoy = BUOYANCY_STRENGTH * self.water_depth * dt
-            self.vy += buoy
-
-            # Terminal velocity clamps
-            self.vy = max(WATER_SINK_CAP, min(WATER_RISE_CAP, self.vy))
-
-            # Velocity drag (water resistance)
-            self.vx *= WATER_HORIZ_DRAG
-            self.vz *= WATER_HORIZ_DRAG
-            self.vy *= WATER_VERT_DRAG
-
-            # Swimming: SPACE rises, SHIFT sinks
-            space_pressed = key and key.SPACE in keys
-            shift_pressed = key and (key.LSHIFT in keys or key.RSHIFT in keys)
-
-            if space_pressed:
-                if not self.head_in_water:
-                    # Surface jump – exit the water
-                    self.vy = WATER_SURFACE_JUMP
-                else:
-                    # Propel upward smoothly
-                    self.vy = min(WATER_RISE_CAP,
-                                  self.vy + WATER_SWIM_FORCE * dt)
-            elif shift_pressed:
-                # Sink / dive
-                self.vy = max(WATER_SINK_CAP,
-                              self.vy - WATER_SWIM_FORCE * dt)
+            self.vx, self.vy, self.vz = apply_water_physics(
+                self.vx, self.vy, self.vz, dt,
+                GRAVITY,
+                self.in_water, self.head_in_water, self.water_depth,
+                space_pressed, shift_pressed,
+            )
         else:
             self.vy -= GRAVITY * dt
-            # Normal jump
-            if key and key.SPACE in keys and self.on_ground:
+            if space_pressed and self.on_ground:
                 self.vy = JUMP_VEL
 
-        # Suppress fall damage when entering water
+        # Cancel fall damage when entering water
         if self.in_water and not self.was_in_water:
-            self.fall_dist = 0.0   # cancel accumulated fall distance
+            self.fall_dist = 0.0
 
         self.was_in_water = self.in_water
 
@@ -227,8 +194,8 @@ class Player:
             self.void_time += dt
             if self.void_time > 2.0:
                 sy = world.surface_y(int(self.x), int(self.z))
-                self.y  = float(sy + 2)
-                self.vy = 0.0
+                self.y     = float(sy + 2)
+                self.vy    = 0.0
                 self.void_time = 0.0
         else:
             self.void_time = 0.0
@@ -239,13 +206,16 @@ class Player:
         W = 0.3
 
         def hit(px: float, py: float, pz: float) -> bool:
-            """True if the player AABB overlaps any solid block (not water/kelp)."""
+            """True if player AABB overlaps any solid block (water is non-solid)."""
             for bx in (px - W, px + W):
                 for bz in (pz - W, pz + W):
-                    for by in (py, py + PLAYER_HEIGHT * 0.5, py + PLAYER_HEIGHT - 0.05):
-                        bt = world.get_block(int(math.floor(bx)),
-                                             int(math.floor(by)),
-                                             int(math.floor(bz)))
+                    for by in (py,
+                               py + PLAYER_HEIGHT * 0.5,
+                               py + PLAYER_HEIGHT - 0.05):
+                        bt = world.get_block(
+                            int(math.floor(bx)),
+                            int(math.floor(by)),
+                            int(math.floor(bz)))
                         if bt and bt < N_BLOCK_TYPES and BT_SOLID[bt]:
                             return True
             return False
@@ -253,30 +223,39 @@ class Player:
         def touch_cactus(px: float, py: float, pz: float) -> bool:
             for bx in (px - W, px + W):
                 for bz in (pz - W, pz + W):
-                    for by in (py, py + PLAYER_HEIGHT * 0.5, py + PLAYER_HEIGHT - 0.05):
-                        bt = world.get_block(int(math.floor(bx)),
-                                             int(math.floor(by)),
-                                             int(math.floor(bz)))
+                    for by in (py,
+                               py + PLAYER_HEIGHT * 0.5,
+                               py + PLAYER_HEIGHT - 0.05):
+                        bt = world.get_block(
+                            int(math.floor(bx)),
+                            int(math.floor(by)),
+                            int(math.floor(bz)))
                         if bt and bt < N_BLOCK_TYPES and _BT_LIST[bt] == BlockType.CACTUS:
                             return True
             return False
 
-        # X
+        # X axis
         self.x += self.vx * dt
         if hit(self.x, self.y, self.z):
             self.x -= self.vx * dt;  self.vx = 0.0
 
-        # Z
+        # Z axis
         self.z += self.vz * dt
         if hit(self.x, self.y, self.z):
             self.z -= self.vz * dt;  self.vz = 0.0
 
-        # Y
-        prev_vy = self.vy
-        self.y += self.vy * dt
+        # Y axis
+        prev_vy   = self.vy
+        self.y   += self.vy * dt
+
+        # Fix for cave-water ceiling glitch:
+        # If the player is inside a water column that has a solid ceiling and
+        # the upward velocity clips them into it, pull back and zero vy.
         if hit(self.x, self.y, self.z):
+            # Always push back exactly one step
+            self.y       -= prev_vy * dt
+            # Clamp: if we were moving up into a ceiling, stop; if falling, land
             self.on_ground = prev_vy < 0
-            self.y        -= prev_vy * dt
             self.vy        = 0.0
         else:
             self.on_ground = False
@@ -285,7 +264,7 @@ class Player:
         if touch_cactus(self.x, self.y, self.z) and self.inv_time <= 0:
             self.take_damage(1.0)
 
-        # Fall damage (only outside water)
+        # Fall damage (suppressed in water)
         if not self.in_water:
             if self.on_ground:
                 if self.fall_dist > 3.0:

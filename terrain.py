@@ -14,7 +14,8 @@ import numpy as np
 from numba import njit
 
 from settings import CHUNK_SIZE, CHUNK_HEIGHT, SEA_LEVEL, BEDROCK_LEVEL, OCEAN_FLOOR
-from water_gen import fill_ocean_column, place_ocean_plants, lake_water_top, ocean_floor_height
+from sea import fill_ocean_column, place_ocean_plants, ocean_floor_height
+from inland_water import river_info, carve_river
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -80,7 +81,10 @@ def _biome_at(wx: int, wz: int, seed: int) -> int:
     if v < -0.3: return 2   # desert
     if v <  0.2: return 0   # plains
     if v <  0.5: return 1   # forest
-    return 3                 # snowy taiga
+    # Snowy taiga only at high elevation
+    h = _terrain_height(wx, wz, seed)
+    if h >= SEA_LEVEL + 18: return 3  # snowy taiga (high ground only)
+    return 1                 # forest instead of snow at low elevation
 
 
 @njit(cache=True)
@@ -153,17 +157,21 @@ def gen_chunk(cx: int, cz: int, seed: int,
             # Coast detection: land cells within ~6 blocks of ocean get sand
             # surface and subsurface, regardless of biome.
             coast = _is_coast(wx, wz, seed)
-            # Inland lake/pond fill - not in snow biome or coast
-            _water_top = -1
-            if biome != 3 and not coast:
-                _water_top = lake_water_top(wx, wz, height, seed)
+            # River carving (inland_water.py)
+            _river_y = -1
+            if biome not in (2, 3) and not coast:
+                _river_y = river_info(wx, wz, height, seed)
 
             if coast:
                 surf = ID_SAND
             elif biome == 2:
                 surf = ID_SAND
             elif biome == 3:
-                surf = ID_SNOW
+                # High peaks: stone only above certain height
+                if height >= SEA_LEVEL + 28:
+                    surf = ID_STONE
+                else:
+                    surf = ID_SNOW
             else:
                 surf = ID_GRASS
 
@@ -176,20 +184,15 @@ def gen_chunk(cx: int, cz: int, seed: int,
                 elif y < height - 3:
                     blk[dx, y, dz] = ID_STONE
                 elif y < height:
-                    # Coast: use sand subsurface instead of dirt
-                    blk[dx, y, dz] = ID_SAND if coast else ID_DIRT
-                elif y == height:
-                    # If this column has water above it, use dirt not grass
-                    if _water_top > height:
-                        blk[dx, y, dz] = ID_DIRT
+                    # Coast: sand; high snow peaks: stone; else dirt
+                    if coast:
+                        blk[dx, y, dz] = ID_SAND
+                    elif biome == 3 and height >= SEA_LEVEL + 28:
+                        blk[dx, y, dz] = ID_STONE
                     else:
-                        blk[dx, y, dz] = surf
-                elif height < SEA_LEVEL - 2:
-                    # Ocean/deep lake: water at SEA_LEVEL
-                    if y == SEA_LEVEL:
-                        blk[dx, y, dz] = ID_WATER
-                elif _water_top > 0 and y == _water_top and height < _water_top:
-                    blk[dx, y, dz] = ID_WATER
+                        blk[dx, y, dz] = ID_DIRT
+                elif y == height:
+                    blk[dx, y, dz] = surf
 
             # ── Cave carving (land only) ──────────────────────────────────
             # Big irregular chambers: low threshold on combined multi-octave noise.
@@ -198,13 +201,24 @@ def gen_chunk(cx: int, cz: int, seed: int,
             shaft_v = _cave_noise_v(float(wx), 0.0, float(wz), seed)
             is_shaft = shaft_v > 0.60   # ~10% of columns get a shaft
 
+            # Some caves are big (25% chance per column)
+            big_cave = _noise2(float(wx) * 0.07, float(wz) * 0.07, seed ^ 0xC4FE) > 0.5
+            cave_thresh = 0.36 if big_cave else 0.44
+            # Cave opening: near-surface shaft that breaks through to sky
+            opening_noise = _noise2(float(wx) * 0.15, float(wz) * 0.15, seed ^ 0xABCD)
+            has_opening = opening_noise > 0.72
+
             for y in range(BEDROCK_LEVEL + 3, height):
-                # Chamber carving – bigger rooms by using a lower threshold (0.42)
-                # and the richer multi-octave _noise3
                 cv = _noise3(float(wx), float(y), float(wz), seed)
-                if cv > 0.42:
+                if cv > cave_thresh:
                     blk[dx, y, dz] = 0
                     continue
+                # Cave opening: carve from surface down 8 blocks in opening columns
+                if has_opening and y >= height - 8 and y < height:
+                    open_cv = _noise3(float(wx), float(y), float(wz), seed ^ 0x77)
+                    if open_cv > 0.35:
+                        blk[dx, y, dz] = 0
+                        continue
 
                 # Vertical shaft: narrow column carved from deep up toward surface.
                 # Only activate above y=10 so we don't punch through bedrock.
@@ -214,6 +228,11 @@ def gen_chunk(cx: int, cz: int, seed: int,
                     # shaft_w in [-1,1]; only carve when it's above 0.15 (medium-wide shafts)
                     if shaft_w > 0.15:
                         blk[dx, y, dz] = 0
+
+            # River carving — applied AFTER terrain y-loop
+            if _river_y > 0:
+                carve_river(blk, dx, dz, height, _river_y,
+                            ID_WATER, ID_DIRT, H)
 
             # Ore placement
             for _ in range(4):
@@ -250,6 +269,8 @@ def gen_chunk(cx: int, cz: int, seed: int,
             if _is_coast(wx, wz, seed): continue
             if h <= SEA_LEVEL: continue
             if blk[dx, h, dz] == ID_WATER: continue
+            # No surface features on rivers
+            if river_info(wx, wz, h, seed) > 0: continue
 
             # Desert cactus
             if biome == 2:
@@ -265,10 +286,8 @@ def gen_chunk(cx: int, cz: int, seed: int,
                 thresh = 4 if biome == 1 else 2
                 if (lcg & 0xFF) >= thresh: continue
                 for y in range(ty, ty + 5):
-                    for tx in (dx, dx + 1):
-                        for tz in (dz, dz + 1):
-                            if 0 <= tx < S and 0 <= tz < S:
-                                blk[tx, y, tz] = ID_LOG
+                    if 0 <= dx < S and 0 <= dz < S:
+                        blk[dx, y, dz] = ID_LOG
                 for ldy in range(4, 8):
                     for ldx in range(-3, 4):
                         for ldz in range(-3, 4):
@@ -279,8 +298,33 @@ def gen_chunk(cx: int, cz: int, seed: int,
                                         blk[lx_, ly_, lz_] = ID_LEAVES
                 continue
 
-            # Spruce tree (snowy taiga)
+            # Tall oak tree (rare, forest biome only)
+            if biome == 1:
+                if (lcg & 0xFF) != 0: pass  # ~0.4% chance
+                else:
+                    # 4-wide trunk, 20 blocks tall
+                    for y in range(ty, ty + 20):
+                        for tx in range(dx, dx + 4):
+                            for tz in range(dz, dz + 4):
+                                if 0 <= tx < S and 0 <= tz < S and y < H:
+                                    blk[tx, y, tz] = ID_LOG
+                    # Big canopy at top
+                    for ldy in range(16, 24):
+                        radius = 6 - max(0, ldy - 20)
+                        for ldx in range(-radius, radius + 1):
+                            for ldz in range(-radius, radius + 1):
+                                if ldx*ldx + ldz*ldz <= (radius+1)*(radius+1):
+                                    lx_ = dx + 2 + ldx
+                                    lz_ = dz + 2 + ldz
+                                    ly_ = ty + ldy
+                                    if 0<=lx_<S and 0<=lz_<S and ly_<H:
+                                        if blk[lx_, ly_, lz_] == 0:
+                                            blk[lx_, ly_, lz_] = ID_LEAVES
+                    continue
+
+            # Spruce tree (snowy taiga) - not on stone peaks
             if biome == 3:
+                if height >= SEA_LEVEL + 28: continue  # stone peak, no trees
                 if (lcg & 0xFF) >= 3: continue
                 for y in range(ty, ty + 6):
                     if 0 <= y < H: blk[dx, y, dz] = ID_SPRUCE_LOG
