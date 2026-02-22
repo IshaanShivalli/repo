@@ -14,7 +14,7 @@ from numba import njit
 from settings import SEA_LEVEL, BEDROCK_LEVEL, CHUNK_HEIGHT
 
 # River water surface — just below sea level so oceans don't bleed in
-RIVER_Y = SEA_LEVEL - 0.2
+RIVER_Y = int(SEA_LEVEL) - 1
 
 # ── Gradient noise (Perlin-style) ─────────────────────────────────────────────
 
@@ -77,7 +77,7 @@ def river_info(wx: int, wz: int, height: int, seed: int) -> int:
     if height <= RIVER_Y:
         return -1
 
-    return RIVER_Y
+    return int(RIVER_Y)
 
 
 @njit(cache=True)
@@ -91,14 +91,15 @@ def carve_river(blk, dx: int, dz: int, height: int,
       - Dirt river bed one block below
     """
     # Air channel above water
-    for y in range(river_y + 1, min(height + 1, H)):
+    ry = int(river_y)
+    for y in range(ry + 1, min(height + 1, H)):
         blk[dx, y, dz] = 0
 
     # Water — always at the same world Y
-    if 0 <= river_y < H:
-        blk[dx, river_y, dz] = ID_WATER
+    if 0 <= ry < H:
+        blk[dx, ry, dz] = ID_WATER
 
     # Soft river bed
-    bed_y = river_y - 1
+    bed_y = ry - 1
     if 0 <= bed_y < H:
         blk[dx, bed_y, dz] = ID_DIRT
