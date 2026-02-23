@@ -14,7 +14,7 @@ import numpy as np
 from block_textures import BlockType
 from settings import (
     CHUNK_SIZE, CHUNK_HEIGHT, N_BLOCK_TYPES, _BT_LIST,
-    BT_SOLID, EYE_OFFSET, PLAYER_HEIGHT, PLAYER_SPEED,
+    BT_SOLID, BT_HIT, EYE_OFFSET, PLAYER_HEIGHT, PLAYER_SPEED,
     GRAVITY, JUMP_VEL, MOUSE_SENS, _lookat,
 )
 from physics import (
@@ -327,7 +327,7 @@ class Player:
 
         for _ in range(int(max_d * 4)):
             bt = world.get_block(ix, iy, iz)
-            if bt and BT_SOLID[bt]:
+            if bt and BT_HIT[bt]:
                 return (ix, iy, iz), norm, prev
             prev = (ix, iy, iz)
             if tmx < tmy and tmx < tmz:

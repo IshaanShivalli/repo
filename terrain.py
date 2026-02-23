@@ -15,7 +15,7 @@ from numba import njit
 
 from settings import CHUNK_SIZE, CHUNK_HEIGHT, SEA_LEVEL, BEDROCK_LEVEL, OCEAN_FLOOR
 from sea import fill_ocean_column, place_ocean_plants, ocean_floor_height
-from inland_water import river_info, carve_river
+from inland_water import river_info, river_depth, carve_river
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -231,7 +231,8 @@ def gen_chunk(cx: int, cz: int, seed: int,
 
             # River carving — applied AFTER terrain y-loop
             if _river_y > 0:
-                carve_river(blk, dx, dz, height, _river_y,
+                _river_d = river_depth(wx, wz, seed)
+                carve_river(blk, dx, dz, height, _river_y, _river_d,
                             ID_WATER, ID_DIRT, H)
 
             # Ore placement
@@ -513,7 +514,7 @@ def build_mesh(blk, nb_x_neg, nb_x_pos, nb_z_neg, nb_z_pos,
 
 @njit(cache=True)
 def build_mesh_split(blk, nb_x_neg, nb_x_pos, nb_z_neg, nb_z_pos,
-                     render, occlude, trans, liquid, rot, colors, face_uv,
+                     render, occlude, trans, liquid, cross, rot, colors, face_uv,
                      cx, cz, greedy):
     """
     Same as build_mesh but returns (opaque_buf, trans_buf) as two separate
@@ -559,6 +560,45 @@ def build_mesh_split(blk, nb_x_neg, nb_x_pos, nb_z_neg, nb_z_pos,
                     lx = idx3[0]; ly = idx3[1]; lz = idx3[2]
                     bt = blk[lx, ly, lz]
                     if bt == 0 or render[bt] == 0:
+                        continue
+
+                    # Cross billboards (torch-like)
+                    if cross[bt] == 1:
+                        if fi != 0:
+                            continue
+                        u0 = face_uv[bt, 0, 0]; v0 = face_uv[bt, 0, 1]
+                        u1 = face_uv[bt, 0, 2]; v1 = face_uv[bt, 0, 3]
+                        cr = colors[bt, 0, 0]; cg = colors[bt, 0, 1]
+                        cb2= colors[bt, 0, 2]; ca = colors[bt, 0, 3]
+                        nx_ = 0.0; ny_ = 1.0; nz_ = 0.0
+                        cx2 = float(lx) + 0.5 + ox
+                        cz2 = float(lz) + 0.5 + oz
+                        y0 = float(ly); y1 = float(ly) + 0.9
+                        w = 0.6
+                        x0 = cx2 - w * 0.5; x1 = cx2 + w * 0.5
+                        z0 = cz2 - w * 0.5; z1 = cz2 + w * 0.5
+                        uv0 = (u0, v1); uv1 = (u0, v0); uv2 = (u1, v0); uv3 = (u1, v1)
+
+                        if trans[bt] == 1:
+                            buf = buf_t; n = nt
+                        else:
+                            buf = buf_o; n = no
+
+                        for vx, vy, vz, uv in (
+                            (x0, y0, z0, uv0), (x0, y1, z0, uv1), (x1, y1, z1, uv2),
+                            (x0, y0, z0, uv0), (x1, y1, z1, uv2), (x1, y0, z1, uv3),
+                            (x0, y0, z1, uv0), (x0, y1, z1, uv1), (x1, y1, z0, uv2),
+                            (x0, y0, z1, uv0), (x1, y1, z0, uv2), (x1, y0, z0, uv3),
+                        ):
+                            if n + 12 <= buf.shape[0]:
+                                buf[n]=vx; buf[n+1]=vy; buf[n+2]=vz
+                                buf[n+3]=nx_; buf[n+4]=ny_; buf[n+5]=nz_
+                                buf[n+6]=cr; buf[n+7]=cg; buf[n+8]=cb2; buf[n+9]=ca
+                                buf[n+10]=uv[0]; buf[n+11]=uv[1]; n+=12
+                        if trans[bt] == 1:
+                            nt = n
+                        else:
+                            no = n
                         continue
 
                     # Transparent: suppress only same-block faces

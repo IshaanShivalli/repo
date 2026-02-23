@@ -38,6 +38,7 @@ USE_TEXTURES     = True
 USE_GREEDY_MESH  = False
 SHOW_ALL_FACES   = True
 USE_WATER        = True          # ← ocean enabled
+ENABLE_MOBS      = False         # temporary: disable mobs
 
 # ── Water physics ─────────────────────────────────────────────────────────────
 WATER_GRAVITY_SCALE  = 0.18   # fraction of normal gravity while submerged
@@ -81,6 +82,7 @@ _BT_LIST = [
     BlockType.REDSTONE_ORE,
     BlockType.LAPIS_ORE,
     BlockType.WATER,
+    BlockType.TORCH,
     BlockType.BIRCH_LOG,
     BlockType.BIRCH_PLANKS,
     BlockType.SPRUCE_PLANKS,
@@ -101,6 +103,7 @@ BT_SOLID  = np.zeros(N_BLOCK_TYPES, dtype=np.uint8)
 BT_TRANS  = np.zeros(N_BLOCK_TYPES, dtype=np.uint8)
 BT_LIQUID = np.zeros(N_BLOCK_TYPES, dtype=np.uint8)  # only water-type blocks
 BT_RENDER = np.zeros(N_BLOCK_TYPES, dtype=np.uint8)
+BT_CROSS  = np.zeros(N_BLOCK_TYPES, dtype=np.uint8)
 BT_ROT    = np.zeros((N_BLOCK_TYPES, 6), dtype=np.int8)
 
 for _i, _bt in enumerate(_BT_LIST):
@@ -109,6 +112,7 @@ for _i, _bt in enumerate(_BT_LIST):
     BT_TRANS[_i]  = 1 if _props.get("transparent", False) else 0
     BT_LIQUID[_i] = 1 if _bt == BlockType.WATER else 0
     BT_RENDER[_i] = 1 if (_bt != BlockType.AIR and (BT_SOLID[_i] or BT_TRANS[_i])) else 0
+    BT_CROSS[_i]  = 1 if _props.get("cross", False) else 0
     _faces = _props.get("rotate_side_faces")
     if _faces:
         _dir = int(_props.get("rotate_side_dir", 1))
@@ -120,6 +124,10 @@ for _i, _bt in enumerate(_BT_LIST):
 # Only truly opaque solid blocks should hide their neighbour's faces.
 # Transparent blocks (leaves, water, kelp, seagrass, cactus) must NOT occlude.
 BT_OCCLUDE = (BT_SOLID & np.where(BT_TRANS, np.uint8(0), np.uint8(1))).astype(np.uint8)
+
+# Blocks that are hittable by raycast (even if non-solid).
+BT_HIT = BT_SOLID.copy()
+BT_HIT[BT_CROSS == 1] = 1
 
 # ═══════════════════════════════════════════════════════════════════════
 #  TEXTURE ATLAS

@@ -532,11 +532,10 @@ class MobRenderer:
                 continue
             try:
                 img = Image.open(path).convert("RGBA")
-                # Ensure the sheet is at least 64×32; scale up if tiny
-                if img.width < 32:
-                    scale = 64 // img.width
-                    img = img.resize((img.width * scale, img.height * scale),
-                                     resample=Image.NEAREST)
+                base_w, base_h = _SHEET.get(mob_type, (64, 32))
+                # Normalize all mob textures to their expected base sheet size
+                if img.size != (base_w, base_h):
+                    img = img.resize((base_w, base_h), resample=Image.NEAREST)
                 tex = self._ctx.texture(img.size, 4, img.tobytes())
                 tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
                 self._textures[mob_type] = tex
@@ -551,7 +550,7 @@ class MobRenderer:
     # ── build & upload vertex data for a single mob ───────────────────────────
     def _build_mob_verts(self, mob: Mob) -> np.ndarray:
         parts   = _PARTS.get(mob.type, [])
-        sw, sh  = self._tex_sizes.get(mob.type, _SHEET.get(mob.type, (64, 32)))
+        sw, sh  = _SHEET.get(mob.type, (64, 32))
         yaw_rad = math.radians(mob.yaw)
 
         verts = []
@@ -653,6 +652,16 @@ class MobManager:
         self.mobs.append(mob)
         return mob
 
+    def _valid_spawn(self, wx: int, wy: int, wz: int, world) -> bool:
+        if world is None:
+            return True
+        # Must spawn in air with solid ground below (prevents underwater spawns)
+        if world.get_block(wx, wy, wz) != 0:
+            return False
+        if not world.is_solid(wx, wy - 1, wz):
+            return False
+        return True
+
     def spawn_initial_passive(self, player_pos: Vec3, world, count: int = 6) -> None:
         spawned, attempts = 0, 0
         while spawned < count and attempts < 40:
@@ -663,6 +672,8 @@ class MobManager:
             wz = int(player_pos.z + dist * math.sin(angle))
             wy = self._surface_y(wx, wz, world) + 1
             if not self._has_sky(wx, wy, wz, world):
+                continue
+            if not self._valid_spawn(wx, wy, wz, world):
                 continue
             mob_type = random.choice([MobType.PIG, MobType.COW,
                                        MobType.CHICKEN, MobType.SHEEP])
@@ -687,6 +698,8 @@ class MobManager:
         wy = self._surface_y(wx, wz, world) + 1
         if not self._has_sky(wx, wy, wz, world):
             return
+        if not self._valid_spawn(wx, wy, wz, world):
+            return
         mob_type = random.choice([MobType.PIG, MobType.COW,
                                    MobType.CHICKEN, MobType.SHEEP])
         self.spawn_mob(mob_type, Vec3(wx, wy, wz))
@@ -703,6 +716,8 @@ class MobManager:
         in_cave  = not self._has_sky(wx, wy, wz, world)
         if not is_night and not in_cave:
             return
+        if not self._valid_spawn(wx, wy, wz, world):
+            return
         mob_type = random.choice([MobType.ZOMBIE, MobType.SKELETON,
                                    MobType.SPIDER, MobType.CREEPER])
         self.spawn_mob(mob_type, Vec3(wx, wy, wz))
@@ -718,14 +733,13 @@ class MobManager:
             mob.ai_timer  += dt
             if mob.attack_cd > 0:
                 mob.attack_cd -= dt
-            if mob.ai_timer >= 1.0:
-                mob.ai_timer = 0.0
-                dmg = self._run_ai(mob, player_pos, world)
-                if dmg and player is not None:
-                    player.take_damage(dmg)
+            dmg = self._run_ai(mob, player_pos, world, dt)
+            if dmg and player is not None:
+                player.take_damage(dmg)
             if world is not None:
                 ground_y = self._surface_y(int(mob.pos.x), int(mob.pos.z), world) + 1
-                mob.pos.y = float(ground_y)
+                if self._valid_spawn(int(mob.pos.x), int(ground_y), int(mob.pos.z), world):
+                    mob.pos.y = float(ground_y)
 
         self._passive_timer += dt
         if self._passive_timer >= self.PASSIVE_SPAWN_INTERVAL:
@@ -738,22 +752,43 @@ class MobManager:
             for _ in range(random.randint(1, 2)):
                 self._try_spawn_hostile(player_pos, world, time_of_day)
 
-    def _run_ai(self, mob: Mob, player_pos: Vec3, world) -> Optional[float]:
+    def _run_ai(self, mob: Mob, player_pos: Vec3, world, dt: float) -> Optional[float]:
+        def blocked(nx: float, nz: float) -> bool:
+            if world is None:
+                return False
+            y0 = mob.pos.y
+            y1 = mob.pos.y + mob.height * 0.6
+            r  = mob.width * 0.35
+            for ox in (-r, r):
+                for oz in (-r, r):
+                    if world.is_solid(nx + ox, y0, nz + oz) or world.is_solid(nx + ox, y1, nz + oz):
+                        return True
+            return False
+
+        def try_move(dx: float, dz: float) -> None:
+            nx = mob.pos.x + dx
+            nz = mob.pos.z + dz
+            if not blocked(nx, mob.pos.z):
+                mob.pos.x = nx
+            if not blocked(mob.pos.x, nz):
+                mob.pos.z = nz
+
         if mob.hostile:
             diff = Vec3(player_pos.x - mob.pos.x, 0, player_pos.z - mob.pos.z)
             dist = diff.length()
             if dist < self.DETECTION_RADIUS:
                 if dist > self.ATTACK_RADIUS:
                     d = diff.normalized()
-                    mob.pos.x += d.x * 0.4
-                    mob.pos.z += d.z * 0.4
+                    step = min(mob.speed * dt * 1.2, 0.20)
+                    try_move(d.x * step, d.z * step)
                     # Face the player
                     mob.yaw = math.degrees(math.atan2(d.x, d.z))
                 if dist <= self.ATTACK_RADIUS and mob.attack_cd <= 0:
                     mob.attack_cd = 1.0
                     return mob.damage
         else:
-            if mob.wander_target is None or random.random() < 0.15:
+            if mob.wander_target is None or mob.ai_timer >= 1.0:
+                mob.ai_timer = 0.0
                 mob.wander_target = Vec3(
                     mob.pos.x + random.uniform(-6, 6),
                     mob.pos.y,
@@ -763,8 +798,8 @@ class MobManager:
                         mob.wander_target.z - mob.pos.z)
             if diff.length() > 0.5:
                 d = diff.normalized()
-                mob.pos.x += d.x * 0.25
-                mob.pos.z += d.z * 0.25
+                step = min(mob.speed * dt * 0.9, 0.15)
+                try_move(d.x * step, d.z * step)
                 mob.yaw    = math.degrees(math.atan2(d.x, d.z))
             else:
                 mob.wander_target = None

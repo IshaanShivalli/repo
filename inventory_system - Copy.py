@@ -147,83 +147,129 @@ FUEL_DATA = {
 }
 
 # ═══════════════════════════════════════════════════════════════════════
-# -----------------------------------------------------------------------------
-# CRAFTING RECIPES (Shaped, Minecraft-style)
-# -----------------------------------------------------------------------------
+#  CRAFTING RECIPES
+#  Format: {output_item: [(ingredient, count), ...]}
+#  The UI matches by summing ingredient counts — no grid layout needed.
+# ═══════════════════════════════════════════════════════════════════════
 
-PLANKS = (BlockType.OAK_PLANKS, BlockType.BIRCH_PLANKS, BlockType.SPRUCE_PLANKS)
-LOGS   = (BlockType.OAK_LOG, BlockType.BIRCH_LOG, BlockType.SPRUCE_LOG)
+_P   = BlockType.OAK_PLANKS    # shorthand for oak planks
+_S   = ItemType.STICK           # shorthand for stick
+_LOG = BlockType.OAK_LOG        # shorthand for oak log
+_COB = BlockType.COBBLESTONE
+_STR = ItemType.STRING
 
-SHAPED_RECIPES = [
-    # Basic conversion
-    {"out": BlockType.OAK_PLANKS,    "count": 4, "pattern": ["L"], "key": {"L": BlockType.OAK_LOG}},
-    {"out": BlockType.BIRCH_PLANKS,  "count": 4, "pattern": ["L"], "key": {"L": BlockType.BIRCH_LOG}},
-    {"out": BlockType.SPRUCE_PLANKS, "count": 4, "pattern": ["L"], "key": {"L": BlockType.SPRUCE_LOG}},
-    {"out": ItemType.STICK,         "count": 4, "pattern": ["P", "P"], "key": {"P": PLANKS}},
+RECIPES = {
 
-    # Wooden tools
-    {"out": ItemType.WOODEN_PICKAXE, "count": 1, "pattern": ["PPP", " S ", " S "], "key": {"P": PLANKS, "S": ItemType.STICK}},
-    {"out": ItemType.WOODEN_AXE,     "count": 1, "pattern": ["PP ", "PS ", " S "], "key": {"P": PLANKS, "S": ItemType.STICK}},
-    {"out": ItemType.WOODEN_AXE,     "count": 1, "pattern": [" PP", " SP", " S "], "key": {"P": PLANKS, "S": ItemType.STICK}},
-    {"out": ItemType.WOODEN_SWORD,   "count": 1, "pattern": [" P ", " P ", " S "], "key": {"P": PLANKS, "S": ItemType.STICK}},
-    {"out": ItemType.WOODEN_SHOVEL,  "count": 1, "pattern": [" P ", " S ", " S "], "key": {"P": PLANKS, "S": ItemType.STICK}},
-    {"out": ItemType.WOODEN_HOE,     "count": 1, "pattern": ["PP ", " S ", " S "], "key": {"P": PLANKS, "S": ItemType.STICK}},
-    {"out": ItemType.WOODEN_HOE,     "count": 1, "pattern": [" PP", " S ", " S "], "key": {"P": PLANKS, "S": ItemType.STICK}},
+    # ── Basic conversion ──────────────────────────────────────────────────────
+    # 1 log → 4 planks
+    BlockType.OAK_PLANKS:    [(_LOG, 1)],
+    BlockType.BIRCH_PLANKS:  [(BlockType.BIRCH_LOG,   1)],
+    BlockType.SPRUCE_PLANKS: [(BlockType.SPRUCE_LOG,  1)],
+    # 2 planks (stacked vertically) → 4 sticks
+    ItemType.STICK:          [(_P, 2)],
 
-    # Stone tools
-    {"out": ItemType.STONE_PICKAXE,  "count": 1, "pattern": ["CCC", " S ", " S "], "key": {"C": BlockType.COBBLESTONE, "S": ItemType.STICK}},
-    {"out": ItemType.STONE_AXE,      "count": 1, "pattern": ["CC ", "CS ", " S "], "key": {"C": BlockType.COBBLESTONE, "S": ItemType.STICK}},
-    {"out": ItemType.STONE_AXE,      "count": 1, "pattern": [" CC", " SC", " S "], "key": {"C": BlockType.COBBLESTONE, "S": ItemType.STICK}},
-    {"out": ItemType.STONE_SWORD,    "count": 1, "pattern": [" C ", " C ", " S "], "key": {"C": BlockType.COBBLESTONE, "S": ItemType.STICK}},
-    {"out": ItemType.STONE_SHOVEL,   "count": 1, "pattern": [" C ", " S ", " S "], "key": {"C": BlockType.COBBLESTONE, "S": ItemType.STICK}},
-    {"out": ItemType.STONE_HOE,      "count": 1, "pattern": ["CC ", " S ", " S "], "key": {"C": BlockType.COBBLESTONE, "S": ItemType.STICK}},
-    {"out": ItemType.STONE_HOE,      "count": 1, "pattern": [" CC", " S ", " S "], "key": {"C": BlockType.COBBLESTONE, "S": ItemType.STICK}},
+    # ── Basic tools (wooden) ─────────────────────────────────────────────────
+    # Pickaxe: 3 planks + 2 sticks
+    ItemType.WOODEN_PICKAXE:  [(_P, 3), (_S, 2)],
+    # Axe: 3 planks + 2 sticks
+    ItemType.WOODEN_AXE:      [(_P, 3), (_S, 2)],
+    # Sword: 2 planks + 1 stick
+    ItemType.WOODEN_SWORD:    [(_P, 2), (_S, 1)],
+    # Shovel: 1 plank + 2 sticks
+    ItemType.WOODEN_SHOVEL:   [(_P, 1), (_S, 2)],
+    # Hoe: 2 planks + 2 sticks
+    ItemType.WOODEN_HOE:      [(_P, 2), (_S, 2)],
 
-    # Iron tools
-    {"out": ItemType.IRON_PICKAXE,   "count": 1, "pattern": ["III", " S ", " S "], "key": {"I": ItemType.IRON_INGOT, "S": ItemType.STICK}},
-    {"out": ItemType.IRON_AXE,       "count": 1, "pattern": ["II ", "IS ", " S "], "key": {"I": ItemType.IRON_INGOT, "S": ItemType.STICK}},
-    {"out": ItemType.IRON_AXE,       "count": 1, "pattern": [" II", " SI", " S "], "key": {"I": ItemType.IRON_INGOT, "S": ItemType.STICK}},
-    {"out": ItemType.IRON_SWORD,     "count": 1, "pattern": [" I ", " I ", " S "], "key": {"I": ItemType.IRON_INGOT, "S": ItemType.STICK}},
-    {"out": ItemType.IRON_SHOVEL,    "count": 1, "pattern": [" I ", " S ", " S "], "key": {"I": ItemType.IRON_INGOT, "S": ItemType.STICK}},
-    {"out": ItemType.IRON_HOE,       "count": 1, "pattern": ["II ", " S ", " S "], "key": {"I": ItemType.IRON_INGOT, "S": ItemType.STICK}},
-    {"out": ItemType.IRON_HOE,       "count": 1, "pattern": [" II", " S ", " S "], "key": {"I": ItemType.IRON_INGOT, "S": ItemType.STICK}},
+    # ── Stone tools ───────────────────────────────────────────────────────────
+    ItemType.STONE_PICKAXE:   [(_COB, 3), (_S, 2)],
+    ItemType.STONE_AXE:       [(_COB, 3), (_S, 2)],
+    ItemType.STONE_SWORD:     [(_COB, 2), (_S, 1)],
+    ItemType.STONE_SHOVEL:    [(_COB, 1), (_S, 2)],
+    ItemType.STONE_HOE:       [(_COB, 2), (_S, 2)],
 
-    # Torches
-    {"out": BlockType.TORCH,         "count": 4, "pattern": ["C", "S"], "key": {"C": (ItemType.COAL, ItemType.CHARCOAL), "S": ItemType.STICK}},
+    # ── Iron tools ────────────────────────────────────────────────────────────
+    ItemType.IRON_PICKAXE:    [(ItemType.IRON_INGOT, 3), (_S, 2)],
+    ItemType.IRON_AXE:        [(ItemType.IRON_INGOT, 3), (_S, 2)],
+    ItemType.IRON_SWORD:      [(ItemType.IRON_INGOT, 2), (_S, 1)],
+    ItemType.IRON_SHOVEL:     [(ItemType.IRON_INGOT, 1), (_S, 2)],
+    ItemType.IRON_HOE:        [(ItemType.IRON_INGOT, 2), (_S, 2)],
 
-    # Wooden building blocks
-    {"out": BlockType.CRAFTING_TABLE,"count": 1, "pattern": ["PP", "PP"], "key": {"P": PLANKS}},
-    {"out": BlockType.CHEST,         "count": 1, "pattern": ["PPP", "P P", "PPP"], "key": {"P": PLANKS}},
-    {"out": BlockType.BOOKSHELF,     "count": 1, "pattern": ["PPP", "BBB", "PPP"], "key": {"P": PLANKS, "B": ItemType.BOOK}},
+    # ── Torches: 1 coal/charcoal + 1 stick → 4 torches ──────────────────────
+    ItemType.TORCH:           [(ItemType.COAL, 1), (_S, 1)],
 
-    {"out": ItemType.WOODEN_DOOR,    "count": 3, "pattern": ["PP", "PP", "PP"], "key": {"P": PLANKS}},
-    {"out": ItemType.TRAPDOOR,       "count": 2, "pattern": ["PPP", "PPP"], "key": {"P": PLANKS}},
-    {"out": ItemType.FENCE,          "count": 3, "pattern": ["PSP", "PSP"], "key": {"P": PLANKS, "S": ItemType.STICK}},
-    {"out": ItemType.FENCE_GATE,     "count": 1, "pattern": ["SPS", "SPS"], "key": {"P": PLANKS, "S": ItemType.STICK}},
-    {"out": ItemType.PRESSURE_PLATE, "count": 1, "pattern": ["PP"], "key": {"P": PLANKS}},
-    {"out": ItemType.BUTTON,         "count": 1, "pattern": ["P"], "key": {"P": PLANKS}},
-    {"out": ItemType.SLAB,           "count": 6, "pattern": ["PPP"], "key": {"P": PLANKS}},
-    {"out": ItemType.LADDER,         "count": 3, "pattern": ["S S", "SSS", "S S"], "key": {"S": ItemType.STICK}},
-    {"out": ItemType.BOWL,           "count": 4, "pattern": ["P P", " P "], "key": {"P": PLANKS}},
-    {"out": ItemType.BOAT,           "count": 1, "pattern": ["P P", "PPP"], "key": {"P": PLANKS}},
-    {"out": ItemType.SIGN,           "count": 3, "pattern": ["PPP", "PPP", " S "], "key": {"P": PLANKS, "S": ItemType.STICK}},
+    # ── Wooden building blocks ────────────────────────────────────────────────
+    # Crafting Table: 4 planks in 2×2
+    BlockType.CRAFTING_TABLE: [(_P, 4)],
+    # Chest: 8 planks around a 3×3 (empty centre)
+    BlockType.CHEST:          [(_P, 8)],
+    # Bookshelf: 6 planks + 3 books
+    BlockType.BOOKSHELF:      [(_P, 6), (ItemType.BOOK, 3)],
 
-    # Glass bottle
-    {"out": ItemType.GLASS_BOTTLE,   "count": 3, "pattern": ["G G", " G "], "key": {"G": BlockType.GLASS}},
+    # Door (3-wide × 2-tall = 6 planks)
+    ItemType.WOODEN_DOOR:     [(_P, 6)],
+    # Trapdoor: 6 planks in a 3×2
+    ItemType.TRAPDOOR:        [(_P, 6)],
+    # Fence: 4 planks + 2 sticks
+    ItemType.FENCE:           [(_P, 4), (_S, 2)],
+    # Fence gate: 2 planks + 4 sticks
+    ItemType.FENCE_GATE:      [(_P, 2), (_S, 4)],
+    # Pressure plate: 2 planks
+    ItemType.PRESSURE_PLATE:  [(_P, 2)],
+    # Button: 1 plank
+    ItemType.BUTTON:          [(_P, 1)],
+    # Slab: 3 planks → 6 slabs  (we yield 6 per craft)
+    ItemType.SLAB:            [(_P, 3)],
 
-    # Flint and steel
-    {"out": ItemType.FLINT_AND_STEEL,"count": 1, "pattern": ["I ", " F"], "key": {"I": ItemType.IRON_INGOT, "F": ItemType.FLINT}},
+    # ── Ladder: 7 sticks ─────────────────────────────────────────────────────
+    ItemType.LADDER:          [(_S, 7)],
 
-    # Cookie / Bread / Paper
-    {"out": ItemType.COOKIE,         "count": 8, "pattern": ["W C W"], "key": {"W": "wheat", "C": "cocoa_beans"}},
-    {"out": ItemType.BREAD,          "count": 1, "pattern": ["WWW"], "key": {"W": "wheat"}},
-    {"out": ItemType.PAPER,          "count": 3, "pattern": ["CCC"], "key": {"C": "sugar_cane"}},
+    # ── Bowl: 3 planks ────────────────────────────────────────────────────────
+    ItemType.BOWL:            [(_P, 3)],
 
-    # Arrow
-    {"out": ItemType.ARROW,          "count": 4, "pattern": ["F", "S", "A"], "key": {"F": ItemType.FLINT, "S": ItemType.STICK, "A": ItemType.FEATHER}},
-]
+    # ── Boat: 5 planks ────────────────────────────────────────────────────────
+    ItemType.BOAT:            [(_P, 5)],
+
+    # ── Sign: 6 planks + 1 stick ─────────────────────────────────────────────
+    ItemType.SIGN:            [(_P, 6), (_S, 1)],
+
+    # ── Bow: 3 sticks + 3 string ─────────────────────────────────────────────
+    ItemType.BOW:             [(_S, 3), (_STR, 3)],
+    # Arrow: 1 flint + 1 stick + 1 feather
+    ItemType.ARROW:           [(ItemType.FLINT, 1), (_S, 1), (ItemType.FEATHER, 1)],
+
+    # ── Paper & Book ──────────────────────────────────────────────────────────
+    ItemType.PAPER:           [("sugar_cane", 3)],
+    ItemType.BOOK:            [(ItemType.PAPER, 3), (ItemType.LEATHER, 1)],
+
+    # ── Fishing rod ──────────────────────────────────────────────────────────
+    ItemType.FISHING_ROD:     [(_S, 3), (_STR, 2)],
+
+    # ── Glass bottle ─────────────────────────────────────────────────────────
+    ItemType.GLASS_BOTTLE:    [(BlockType.GLASS, 3)],
+
+    # ── Flint and steel ──────────────────────────────────────────────────────
+    ItemType.FLINT_AND_STEEL: [(ItemType.IRON_INGOT, 1), (ItemType.FLINT, 1)],
+
+    # ── Cookie: 2 wheat + 1 cocoa beans ──────────────────────────────────────
+    ItemType.COOKIE:          [("wheat", 2), ("cocoa_beans", 1)],
+    # Bread: 3 wheat
+    ItemType.BREAD:           [("wheat", 3)],
+}
+
+# Crafting output yields (defaults to 1 if not listed)
+CRAFT_YIELD = {
+    BlockType.OAK_PLANKS:    4,
+    BlockType.BIRCH_PLANKS:  4,
+    BlockType.SPRUCE_PLANKS: 4,
+    ItemType.STICK:          4,
+    ItemType.TORCH:          4,
+    ItemType.SLAB:           6,
+    ItemType.WOODEN_DOOR:    2,
+    ItemType.TRAPDOOR:       2,
+}
 
 
+# ═══════════════════════════════════════════════════════════════════════
 #  LEGACY CLASS SHIM  (main.py imports PlayerInventorySystem from here)
 # ═══════════════════════════════════════════════════════════════════════
 class PlayerInventorySystem:

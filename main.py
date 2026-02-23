@@ -23,7 +23,7 @@ import moderngl
 
 # ── project modules ───────────────────────────────────────────────────────────
 from block_textures import BlockType, BLOCK_DATA, HEART_TEX, BUBBLE_FRAMES
-from inventory_system import PlayerInventorySystem, ItemType, FOOD_DATA, RECIPES, FURNACE_RECIPES, FUEL_DATA
+from inventory_system import PlayerInventorySystem, ItemType, FOOD_DATA, SHAPED_RECIPES, FURNACE_RECIPES, FUEL_DATA
 from mobs import MobManager, MobType, Vec3 as MobVec3
 import sun_moon
 
@@ -33,11 +33,12 @@ from settings import (
     GRAVITY, JUMP_VEL, PLAYER_SPEED, PLAYER_HEIGHT, EYE_OFFSET,
     MOUSE_SENS, FOV, WIN_W, WIN_H,
     ENABLE_WIREFRAME, EDGE_COLOR, EDGE_WIDTH,
-    TILE_SIZE, USE_TEXTURES, USE_GREEDY_MESH, SHOW_ALL_FACES, USE_WATER,
+    TILE_SIZE, USE_TEXTURES, USE_GREEDY_MESH, SHOW_ALL_FACES, USE_WATER, ENABLE_MOBS,
     WATER_MAX_OPS, WATER_TICK_INTERVAL,
     AIR, _BT_LIST, BT, N_BLOCK_TYPES,
     BT_SOLID, BT_TRANS, BT_LIQUID, BT_RENDER, BT_ROT,
     BT_OCCLUDE,          # ← the fixed occlusion mask (solid AND opaque)
+    BT_CROSS,
     FACE_UV, FACE_COLORS,
     _atlas_img, _uv_map, _white_key,
     _persp, _lookat, _load_image_rgba,
@@ -433,6 +434,14 @@ class Renderer:
         self.sun_vao2 = ctx.vertex_array(self.sunp, [(self.sun_vbo,  '3f 2f', 'in_pos', 'in_uv')])
         self.moon_vbo = ctx.buffer(reserve=6*5*4)
         self.moon_vao = ctx.vertex_array(self.sunp, [(self.moon_vbo, '3f 2f', 'in_pos', 'in_uv')])
+        self.torch_vbo = ctx.buffer(reserve=6*5*4)
+        self.torch_vao = ctx.vertex_array(self.sunp, [(self.torch_vbo, '3f 2f', 'in_pos', 'in_uv')])
+        flame_img = _load_image_rgba(_resolve_path("textures/assets/minecraft/textures/particle/flame.png"))
+        self.torch_tex = ctx.texture(flame_img.size, 4, flame_img.tobytes()) if flame_img else None
+        if self.torch_tex:
+            self.torch_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        self._torch_scan_t = 0.0
+        self._torch_positions = []
 
         ctx.enable(moderngl.DEPTH_TEST)
         ctx.enable(moderngl.BLEND)
@@ -470,7 +479,7 @@ class Renderer:
         # Two-pass render: split opaque and transparent into separate VAOs
         vdata_o, vdata_t = build_mesh_split(
             ch.blocks, nb_x_neg, nb_x_pos, nb_z_neg, nb_z_pos,
-            BT_RENDER, BT_OCCLUDE, BT_TRANS, BT_LIQUID, BT_ROT, FACE_COLORS, FACE_UV,
+            BT_RENDER, BT_OCCLUDE, BT_TRANS, BT_LIQUID, BT_CROSS, BT_ROT, FACE_COLORS, FACE_UV,
             ch.cx, ch.cz,
             1 if USE_GREEDY_MESH else 0,
         )
@@ -637,6 +646,59 @@ class Renderer:
                 entry[6].render(moderngl.TRIANGLES, vertices=entry[5])
             elif entry[5] > 0:
                 entry[3].render(moderngl.TRIANGLES, vertices=entry[5])
+
+        # Torch particles (flame)
+        torch_id = BT.get(BlockType.TORCH, 0)
+        if self.torch_tex and torch_id:
+            if self.water_time - self._torch_scan_t > 0.5:
+                positions = []
+                for k2 in self._vaos.keys():
+                    ch = world.chunks.get(k2)
+                    if not ch:
+                        continue
+                    locs = np.argwhere(ch.blocks == torch_id)
+                    if locs.size == 0:
+                        continue
+                    ox = k2[0] * CHUNK_SIZE
+                    oz = k2[1] * CHUNK_SIZE
+                    for lx, ly, lz in locs:
+                        positions.append((ox + float(lx) + 0.5, float(ly) + 0.7, oz + float(lz) + 0.5))
+                if len(positions) > 200:
+                    positions = positions[:200]
+                self._torch_positions = positions
+                self._torch_scan_t = self.water_time
+            positions = self._torch_positions
+            if positions:
+                fx, fy, fz = player.forward()
+                fl = math.sqrt(fx*fx+fy*fy+fz*fz);  fx/=fl; fy/=fl; fz/=fl
+                rx,ry,rz = fy*0-fz*1, fz*0-fx*0, fx*1-fy*0
+                rl = math.sqrt(rx*rx+ry*ry+rz*rz)
+                if rl < 1e-6: rx,ry,rz = 1.,0.,0.
+                else:         rx/=rl; ry/=rl; rz/=rl
+                ux,uy,uz = ry*fz-rz*fy, rz*fx-rx*fz, rx*fy-ry*fx
+
+                proj = _persp(FOV, w/h, 0.05, 800.)
+                view = player.view_mat()
+                mvp  = proj @ view
+                self.sunp['u_mvp'].write(mvp.T.astype(np.float32).tobytes())
+                self.torch_tex.use(0);  self.sunp['u_tex'].value = 0
+
+                def write_bb(vbo, center, size):
+                    cx2,cy2,cz2 = center
+                    sx2=rx*size; sy2=ry*size; sz2=rz*size
+                    ux2=ux*size; uy2=uy*size; uz2=uz*size
+                    p0=(cx2-sx2-ux2,cy2-sy2-uy2,cz2-sz2-uz2)
+                    p1=(cx2+sx2-ux2,cy2+sy2-uy2,cz2+sz2-uz2)
+                    p2=(cx2+sx2+ux2,cy2+sy2+uy2,cz2+sz2+uz2)
+                    p3=(cx2-sx2+ux2,cy2-sy2+uy2,cz2-sz2+uz2)
+                    data = np.array([*p0,0.,1.,*p1,1.,1.,*p2,1.,0.,
+                                      *p0,0.,1.,*p2,1.,0.,*p3,0.,0.], dtype=np.float32)
+                    vbo.write(data.tobytes())
+
+                for i, pos in enumerate(positions):
+                    size = 0.12 + 0.03 * math.sin(self.water_time * 6.0 + i)
+                    write_bb(self.torch_vbo, pos, size)
+                    self.torch_vao.render(moderngl.TRIANGLES)
         self.ctx.depth_mask = True
 
         if ENABLE_WIREFRAME:
@@ -654,26 +716,95 @@ class Renderer:
 # ═══════════════════════════════════════════════════════════════════════
 
 _icon_cache: dict = {}
+_item_tex_index: dict = {}
+_icon_missing: set = set()
+_ICON_FALLBACK = "textures/assets/minecraft/textures/block/oak_planks.png"
+_ICON_ALIAS = {
+    "oak_button": "oak_planks",
+    "oak_pressure_plate": "oak_planks",
+    "oak_slab": "oak_planks",
+}
+_BASE_DIR = os.path.dirname(__file__)
+_CWD = os.getcwd()
+
+
+def _resolve_path(p: str):
+    if not p:
+        return p
+    if os.path.isabs(p):
+        return os.path.normpath(p)
+    # Try project dir first, then cwd
+    cand = os.path.normpath(os.path.join(_BASE_DIR, p))
+    if os.path.exists(cand):
+        return cand
+    cand = os.path.normpath(os.path.join(_CWD, p))
+    return cand
+
+
+def _build_item_tex_index():
+    if _item_tex_index:
+        return
+    root = _resolve_path("textures/assets/minecraft/textures/item")
+    if not root or not os.path.isdir(root):
+        return
+    for dirpath, _, files in os.walk(root):
+        for fn in files:
+            if not fn.lower().endswith(".png"):
+                continue
+            key = os.path.splitext(fn)[0]
+            _item_tex_index[key] = os.path.join(dirpath, fn)
 
 
 def _load_icon(item: str) -> pyglet.image.AbstractImage:
+    if not isinstance(item, str):
+        item = str(item)
+    item = item.strip()
+    if not item or item.lower() in ("none", "null"):
+        return _blank()
+    alias = _ICON_ALIAS.get(item, item)
     if item in _icon_cache:
         return _icon_cache[item]
+    _build_item_tex_index()
     props = BLOCK_DATA.get(item, {})
-    path  = (props.get("texture") or props.get("texture_top") or
-             props.get("texture_side") or props.get("texture_bottom"))
-    if not path or not os.path.exists(path):
-        path = f"textures/assets/minecraft/textures/item/{item}.png"
-    if path and os.path.exists(path):
+    props = BLOCK_DATA.get(alias, props)
+    path_candidates = [
+        _item_tex_index.get(alias),
+        props.get("texture"),
+        props.get("texture_top"),
+        props.get("texture_side"),
+        props.get("texture_bottom"),
+        f"textures/assets/minecraft/textures/item/{alias}.png",
+        f"textures/assets/minecraft/textures/block/{alias}.png",
+    ]
+
+    path = None
+    for p in path_candidates:
+        p2 = _resolve_path(p) if p else None
+        if p2 and os.path.exists(p2):
+            path = p2
+            break
+
+    if path:
         try:
             img = pyglet.image.load(path)
             _icon_cache[item] = img
             return img
         except Exception:
             pass
-    img = pyglet.image.SolidColorImagePattern((180, 60, 60, 255)).create_image(16, 16)
-    _icon_cache[item] = img
-    return img
+    # Fallback for missing item textures (use planks so UI isn't red).
+    fb = _resolve_path(_ICON_FALLBACK)
+    if fb and os.path.exists(fb):
+        try:
+            img = pyglet.image.load(fb)
+            _icon_cache[item] = img
+            return img
+        except Exception:
+            pass
+    # Don't cache failures; allow retry if paths become available.
+    if item not in _icon_missing:
+        print(f"[icon-miss] item='{item}'")
+        _icon_missing.add(item)
+    return pyglet.image.SolidColorImagePattern((180, 60, 60, 255)).create_image(16, 16)
 
 
 def _blank():
@@ -693,6 +824,94 @@ def _ui_scale(win):
 
 
 MAX_STACK = 64
+
+
+def _pretty_name(item_id):
+    if not item_id:
+        return ""
+    s = str(item_id).replace("_", " ").strip()
+    return " ".join(w.capitalize() for w in s.split())
+
+
+def _item_allowed(item, allowed):
+    if isinstance(allowed, (list, tuple, set)):
+        return item in allowed
+    return item == allowed
+
+
+def _pattern_size(pattern):
+    h = len(pattern)
+    w = max((len(r) for r in pattern), default=0)
+    return w, h
+
+
+def _pattern_area(pattern):
+    return sum(1 for r in pattern for ch in r if ch != " ")
+
+
+def _match_pattern(grid_items, grid_counts, grid_w, grid_h, pattern, key):
+    pat_w, pat_h = _pattern_size(pattern)
+    if pat_w == 0 or pat_h == 0:
+        return None
+    if pat_w > grid_w or pat_h > grid_h:
+        return None
+
+    best = None
+    for off_y in range(grid_h - pat_h + 1):
+        for off_x in range(grid_w - pat_w + 1):
+            slots = []
+            crafts = None
+            ok = True
+            for gy in range(grid_h):
+                for gx in range(grid_w):
+                    idx = gy * grid_w + gx
+                    item = grid_items[idx]
+                    count = grid_counts[idx]
+                    in_pat = (off_x <= gx < off_x + pat_w) and (off_y <= gy < off_y + pat_h)
+                    if in_pat:
+                        row = pattern[gy - off_y]
+                        ch = row[gx - off_x] if (gx - off_x) < len(row) else " "
+                        if ch == " ":
+                            if item is not None:
+                                ok = False
+                                break
+                        else:
+                            allowed = key.get(ch)
+                            if allowed is None or item is None or not _item_allowed(item, allowed):
+                                ok = False
+                                break
+                            slots.append((idx, 1))
+                            crafts = (count // 1) if crafts is None else min(crafts, count // 1)
+                    else:
+                        if item is not None:
+                            ok = False
+                            break
+                if not ok:
+                    break
+            if ok and crafts and crafts > 0:
+                candidate = {"slots": slots, "crafts": crafts, "offset": (off_x, off_y)}
+                if best is None or candidate["crafts"] > best["crafts"]:
+                    best = candidate
+    return best
+
+
+def _find_best_recipe(craft_items, grid_w, grid_h):
+    items = [c[0] if c else None for c in craft_items]
+    counts = [c[1] if c else 0 for c in craft_items]
+    best = None
+    best_area = -1
+    for recipe in SHAPED_RECIPES:
+        pattern = recipe.get("pattern", [])
+        key = recipe.get("key", {})
+        match = _match_pattern(items, counts, grid_w, grid_h, pattern, key)
+        if not match:
+            continue
+        area = _pattern_area(pattern)
+        crafts = match["crafts"]
+        if best is None or crafts > best["match"]["crafts"] or (crafts == best["match"]["crafts"] and area > best_area):
+            best = {"recipe": recipe, "match": match}
+            best_area = area
+    return best
 
 
 class SlotInventory:
@@ -1089,7 +1308,7 @@ class InventoryScreen:
         self._win=win; self._visible=False; self._batch=pyglet.graphics.Batch()
         self._panel=None; self._title=None; self._main_slots=[]; self._hb_slots=[]
         self._craft_slots=[]; self._craft_out=None; self._craft_arrow=None; self._sep=None
-        self._craft_items=[None]*4; self._craft_result=None; self._rebuild()
+        self._craft_items=[None]*4; self._craft_result=None; self._craft_out_count=0; self._craft_match=None; self._rebuild()
     def _sz(self):  return int(32*_ui_scale(self._win))
     def _gap(self): return max(2,int(4*_ui_scale(self._win)))
     def _rebuild(self):
@@ -1134,17 +1353,23 @@ class InventoryScreen:
         self._sep.visible=False
         self._px=px; self._py=py; self._pw=pw; self._ph=ph; self._panel.show(False)
     def _update_craft_output(self):
-        counts={}
-        for cd in self._craft_items:
-            if cd: counts[cd[0]]=counts.get(cd[0],0)+cd[1]
-        result=None
-        for out,reqs in RECIPES.items():
-            needed={}
-            for ing,cnt in reqs: needed[ing]=needed.get(ing,0)+cnt
-            if counts==needed: result=out; break
-        self._craft_result=result
-        if result: self._craft_out.set(result,1)
-        else:      self._craft_out.set(None,0)
+        best = _find_best_recipe(self._craft_items, 2, 2)
+        if not best:
+            self._craft_result = None
+            self._craft_out_count = 0
+            self._craft_match = None
+            self._craft_out.set(None,0)
+            return
+        recipe = best["recipe"]
+        match = best["match"]
+        out_item = recipe["out"]
+        out_each = recipe.get("count", 1)
+        crafts = match["crafts"]
+        out_n = min(MAX_STACK, crafts * out_each)
+        self._craft_result = out_item
+        self._craft_out_count = out_n
+        self._craft_match = {"slots": match["slots"], "out_each": out_each}
+        self._craft_out.set(out_item, out_n)
     def _refresh(self,inv):
         s=inv.slots
         for i,su in enumerate(self._main_slots):
@@ -1184,20 +1409,34 @@ class InventoryScreen:
         return None
     def hit_craft_output(self,x,y):
         return bool(self._craft_out and self._craft_out.hit(x,y))
-    def take_craft_output(self,inv):
-        if not self._craft_result: return None
-        reqs=RECIPES.get(self._craft_result,[])
-        for ing,cnt in reqs:
-            have=sum(cd[1] for cd in self._craft_items if cd and cd[0]==ing)
-            if have<cnt: return None
-        for ing,cnt_needed in reqs:
-            left=cnt_needed
-            for i in range(4):
-                cd=self._craft_items[i]
-                if cd and cd[0]==ing and left>0:
-                    take=min(cd[1],left); rem=cd[1]-take
-                    self._craft_items[i]=(ing,rem) if rem>0 else None; left-=take
-        inv.slots.add(self._craft_result,1); self._refresh(inv); return self._craft_result
+    def take_craft_output(self,inv, take_all=False, to_inventory=False):
+        if not self._craft_result or self._craft_out_count <= 0 or not self._craft_match:
+            return None
+        out_each = self._craft_match["out_each"]
+        crafts_avail = self._craft_out_count // out_each
+        crafts_take = crafts_avail if take_all else 1
+        if crafts_take <= 0:
+            return None
+        desired = crafts_take * out_each
+        if to_inventory:
+            leftover = inv.slots.add(self._craft_result, desired)
+            actual = desired - leftover
+            crafts_used = actual // out_each
+        else:
+            actual = desired
+            crafts_used = crafts_take
+        if crafts_used <= 0:
+            return None
+        for idx, per_craft in self._craft_match["slots"]:
+            cd = self._craft_items[idx]
+            if not cd:
+                continue
+            item, count = cd
+            take = per_craft * crafts_used
+            rem = count - take
+            self._craft_items[idx] = (item, rem) if rem > 0 else None
+        self._refresh(inv)
+        return (self._craft_result, actual) if actual > 0 else None
     def in_panel(self,x,y):
         return (self._visible and self._px<=x<=self._px+self._pw and self._py<=y<=self._py+self._ph)
 
@@ -1208,7 +1447,7 @@ class CraftingTableScreen:
         self._win=win; self._visible=False; self._batch=pyglet.graphics.Batch()
         self._panel=None; self._title=None; self._craft_slots=[]; self._craft_out=None
         self._craft_arrow=None; self._main_slots=[]; self._hb_slots=[]; self._sep=None
-        self._craft_items=[None]*9; self._craft_result=None; self._rebuild()
+        self._craft_items=[None]*9; self._craft_result=None; self._craft_out_count=0; self._craft_match=None; self._rebuild()
     def _sz(self):  return int(32*_ui_scale(self._win))
     def _gap(self): return max(2,int(4*_ui_scale(self._win)))
     def _rebuild(self):
@@ -1253,17 +1492,23 @@ class CraftingTableScreen:
         self._sep.visible=False
         self._px=px; self._py=py; self._pw=pw; self._ph=ph; self._panel.show(False)
     def _update_craft_output(self):
-        counts={}
-        for cd in self._craft_items:
-            if cd: counts[cd[0]]=counts.get(cd[0],0)+cd[1]
-        result=None
-        for out,reqs in RECIPES.items():
-            needed={}
-            for ing,cnt in reqs: needed[ing]=needed.get(ing,0)+cnt
-            if counts==needed: result=out; break
-        self._craft_result=result
-        if result: self._craft_out.set(result,1)
-        else:      self._craft_out.set(None,0)
+        best = _find_best_recipe(self._craft_items, 3, 3)
+        if not best:
+            self._craft_result = None
+            self._craft_out_count = 0
+            self._craft_match = None
+            self._craft_out.set(None,0)
+            return
+        recipe = best["recipe"]
+        match = best["match"]
+        out_item = recipe["out"]
+        out_each = recipe.get("count", 1)
+        crafts = match["crafts"]
+        out_n = min(MAX_STACK, crafts * out_each)
+        self._craft_result = out_item
+        self._craft_out_count = out_n
+        self._craft_match = {"slots": match["slots"], "out_each": out_each}
+        self._craft_out.set(out_item, out_n)
     def _refresh(self,inv):
         s=inv.slots
         for i,su in enumerate(self._main_slots):
@@ -1297,20 +1542,34 @@ class CraftingTableScreen:
         return None
     def hit_craft_output(self,x,y):
         return bool(self._craft_out and self._craft_out.hit(x,y))
-    def take_craft_output(self,inv):
-        if not self._craft_result: return None
-        reqs=RECIPES.get(self._craft_result,[])
-        for ing,cnt in reqs:
-            have=sum(cd[1] for cd in self._craft_items if cd and cd[0]==ing)
-            if have<cnt: return None
-        for ing,cnt_needed in reqs:
-            left=cnt_needed
-            for i in range(9):
-                cd=self._craft_items[i]
-                if cd and cd[0]==ing and left>0:
-                    take=min(cd[1],left); rem=cd[1]-take
-                    self._craft_items[i]=(ing,rem) if rem>0 else None; left-=take
-        inv.slots.add(self._craft_result,1); self._refresh(inv); return self._craft_result
+    def take_craft_output(self,inv, take_all=False, to_inventory=False):
+        if not self._craft_result or self._craft_out_count <= 0 or not self._craft_match:
+            return None
+        out_each = self._craft_match["out_each"]
+        crafts_avail = self._craft_out_count // out_each
+        crafts_take = crafts_avail if take_all else 1
+        if crafts_take <= 0:
+            return None
+        desired = crafts_take * out_each
+        if to_inventory:
+            leftover = inv.slots.add(self._craft_result, desired)
+            actual = desired - leftover
+            crafts_used = actual // out_each
+        else:
+            actual = desired
+            crafts_used = crafts_take
+        if crafts_used <= 0:
+            return None
+        for idx, per_craft in self._craft_match["slots"]:
+            cd = self._craft_items[idx]
+            if not cd:
+                continue
+            item, count = cd
+            take = per_craft * crafts_used
+            rem = count - take
+            self._craft_items[idx] = (item, rem) if rem > 0 else None
+        self._refresh(inv)
+        return (self._craft_result, actual) if actual > 0 else None
     def hit_main(self,x,y):
         for i,s in enumerate(self._main_slots):
             if s.hit(x,y): return i,s.item,s.count
@@ -1483,6 +1742,10 @@ class UIManager:
         self._l4=pyglet.text.Label('',x=8,y=16,  font_size=10,color=(255,255,180,220),batch=self._hb)
         self._inv_scr=InventoryScreen(win); self._cft_scr=CraftingTableScreen(win)
         self._fur_scr=FurnaceScreen(win); self._drag=DragStack(); self._mode=self.NONE
+        self._tip_batch=pyglet.graphics.Batch()
+        self._tip_bg=pyglet.shapes.Rectangle(0,0,10,10,color=(20,20,20),batch=self._tip_batch)
+        self._tip_lbl=pyglet.text.Label('',x=0,y=0,font_size=10,color=(255,255,255,255),batch=self._tip_batch)
+        self._tip_bg.visible=False; self._tip_lbl.visible=False
     @property
     def is_open(self): return self._mode!=self.NONE
     def _hide_all(self): self._inv_scr.hide(); self._cft_scr.hide(); self._fur_scr.hide()
@@ -1526,6 +1789,14 @@ class UIManager:
             hint=f"[{sel}]  WASD=swim  Space=rise  Shift=dive  LMB=mine  RMB=place"
         else:
             hint=f"[{sel}]  WASD  Space=jump  LMB=mine  RMB=place  1-9=slot  F=eat  E=inv"
+        if not self.is_open:
+            rc = player.raycast(world)
+            if rc:
+                pos, _, _ = rc
+                bt = world.get_block(*pos)
+                name = _pretty_name(bt)
+                if name:
+                    hint = f"{hint}  |  {name}"
         self._l4.text=hint
         self._bars.update(player, dt); self._hotbar.refresh(inv)
     def draw(self):
@@ -1533,6 +1804,7 @@ class UIManager:
         if   self._mode==self.INV:     self._inv_scr.draw()
         elif self._mode==self.CRAFT:   self._cft_scr.draw()
         elif self._mode==self.FURNACE: self._fur_scr.draw()
+        self._tip_batch.draw()
         self._drag.draw()
     def _slot_sz(self): return self._hotbar.sz
     def _pick_up_slot(self,item,count,x,y):
@@ -1574,8 +1846,14 @@ class UIManager:
             scr=self._inv_scr
             if scr.hit_craft_output(x,y):
                 if not self._drag.active:
-                    result=scr.take_craft_output(inv)
-                    if result: self._pick_up_slot(result,1,x,y); scr.refresh(inv); self._hotbar.refresh(inv)
+                    if shift_held:
+                        scr.take_craft_output(inv, take_all=True, to_inventory=True)
+                    else:
+                        got = scr.take_craft_output(inv, take_all=False, to_inventory=False)
+                        if got:
+                            item, cnt = got
+                            self._pick_up_slot(item, cnt, x, y)
+                    scr.refresh(inv); self._hotbar.refresh(inv)
                 return True
             ci=scr.hit_craft_input(x,y)
             if ci is not None:
@@ -1625,8 +1903,14 @@ class UIManager:
             scr=self._cft_scr
             if scr.hit_craft_output(x,y):
                 if not self._drag.active:
-                    result=scr.take_craft_output(inv)
-                    if result: self._pick_up_slot(result,1,x,y); scr.refresh(inv); self._hotbar.refresh(inv)
+                    if shift_held:
+                        scr.take_craft_output(inv, take_all=True, to_inventory=True)
+                    else:
+                        got = scr.take_craft_output(inv, take_all=False, to_inventory=False)
+                        if got:
+                            item, cnt = got
+                            self._pick_up_slot(item, cnt, x, y)
+                    scr.refresh(inv); self._hotbar.refresh(inv)
                 return True
             ci=scr.hit_craft_input(x,y)
             if ci is not None:
@@ -1720,7 +2004,15 @@ class UIManager:
         return False
     def on_release(self,x,y,btn): pass
     def on_motion(self,x,y):
-        if self._drag.active: self._drag.move(x,y,self._slot_sz())
+        if self._drag.active:
+            self._drag.move(x,y,self._slot_sz())
+            self._set_tooltip(None,0,0)
+            return
+        if self.is_open:
+            item = self._hover_item_at(x, y)
+            self._set_tooltip(_pretty_name(item) if item else None, x, y)
+        else:
+            self._set_tooltip(None,0,0)
     def resize(self,w,h):
         self._l1.y=h-18; self._l2.y=h-36; self._l3.y=h-54
         self._hotbar.resize(); self._bars.resize()
@@ -1730,6 +2022,70 @@ class UIManager:
         if   mode==self.INV:     self._inv_scr.show(inv)
         elif mode==self.CRAFT:   self._cft_scr.show(inv)
         elif mode==self.FURNACE: self._fur_scr.show(inv)
+
+    def _set_tooltip(self, text, x, y):
+        if not text:
+            self._tip_bg.visible=False
+            self._tip_lbl.visible=False
+            return
+        pad=4
+        self._tip_lbl.text=text
+        self._tip_lbl.visible=True
+        w=int(self._tip_lbl.content_width)+pad*2
+        h=int(self._tip_lbl.content_height)+pad*2
+        tx=min(self._win.width - w - 4, x + 12)
+        ty=min(self._win.height - h - 4, y + 12)
+        self._tip_bg.x=tx; self._tip_bg.y=ty; self._tip_bg.width=w; self._tip_bg.height=h
+        self._tip_bg.visible=True
+        self._tip_lbl.x=tx+pad; self._tip_lbl.y=ty+pad
+
+    def _hover_item_at(self, x, y):
+        if self._mode==self.INV:
+            scr=self._inv_scr
+            if scr.hit_craft_output(x,y) and scr._craft_out and scr._craft_out.item:
+                return scr._craft_out.item
+            ci=scr.hit_craft_input(x,y)
+            if ci is not None:
+                cd=scr._craft_items[ci]
+                if cd: return cd[0]
+            res=scr.hit_main(x,y)
+            if res is not None:
+                _,item,_=res
+                if item: return item
+            res=scr.hit_hotbar(x,y)
+            if res is not None:
+                _,item,_=res
+                if item: return item
+        elif self._mode==self.CRAFT:
+            scr=self._cft_scr
+            if scr.hit_craft_output(x,y) and scr._craft_out and scr._craft_out.item:
+                return scr._craft_out.item
+            ci=scr.hit_craft_input(x,y)
+            if ci is not None:
+                cd=scr._craft_items[ci]
+                if cd: return cd[0]
+            res=scr.hit_main(x,y)
+            if res is not None:
+                _,item,_=res
+                if item: return item
+            res=scr.hit_hotbar(x,y)
+            if res is not None:
+                _,item,_=res
+                if item: return item
+        elif self._mode==self.FURNACE:
+            fs=self._fur_scr
+            if fs.hit_in(x,y) and fs.input_item: return fs.input_item
+            if fs.hit_fuel(x,y) and fs.fuel_item: return fs.fuel_item
+            if fs.hit_out(x,y) and fs.output_item: return fs.output_item
+            res=fs.hit_main(x,y)
+            if res is not None:
+                _,item,_=res
+                if item: return item
+            res=fs.hit_hotbar(x,y)
+            if res is not None:
+                _,item,_=res
+                if item: return item
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1756,8 +2112,10 @@ class GameWindow(pyglet.window.Window):
         self.inventory.slots.add(BlockType.CRAFTING_TABLE, 1)
         self.inventory.slots.add(BlockType.FURNACE,        1)
 
-        self.mob_manager = MobManager()
-        self.mob_manager.init_gl(self.ctx)
+        self.mob_manager = None
+        if ENABLE_MOBS:
+            self.mob_manager = MobManager()
+            self.mob_manager.init_gl(self.ctx)
 
         self._ui = UIManager(self)
 
@@ -1779,8 +2137,9 @@ class GameWindow(pyglet.window.Window):
         self.player = Player(sx + 0.5, float(sy + 3), sz + 0.5)
         print(f"🧍 Spawn ({sx},{sy+3:.0f},{sz})")
 
-        spawn_pos = MobVec3(self.player.x, self.player.y, self.player.z)
-        self.mob_manager.spawn_initial_passive(spawn_pos, self.world, count=6)
+        if self.mob_manager:
+            spawn_pos = MobVec3(self.player.x, self.player.y, self.player.z)
+            self.mob_manager.spawn_initial_passive(spawn_pos, self.world, count=6)
 
         self.keys      = set()
         self._captured = False
@@ -1819,8 +2178,9 @@ class GameWindow(pyglet.window.Window):
         self.player.update(dt, self.world,
                            self.keys if not self._ui.is_open else set(), mx, mz)
         player_mob_pos = MobVec3(self.player.x, self.player.y, self.player.z)
-        self.mob_manager.update_mobs(dt, player_mob_pos, self.world,
-                                     self.player, self.world.time_of_day)
+        if self.mob_manager:
+            self.mob_manager.update_mobs(dt, player_mob_pos, self.world,
+                                         self.player, self.world.time_of_day)
         self._stream()
         self._ui.update_hud(self.player, self.world, self._fps_buf, dt)
 
@@ -1835,7 +2195,8 @@ class GameWindow(pyglet.window.Window):
         proj = _persp(FOV, self.width/self.height, 0.05, 800.0)
         view = self.player.view_mat()
         mvp  = proj @ view
-        self.mob_manager.draw_mobs(mvp, self.player.yaw, self.player.pitch)
+        if self.mob_manager:
+            self.mob_manager.draw_mobs(mvp, self.player.yaw, self.player.pitch)
 
     def on_key_press(self, sym, mod):
         self.keys.add(sym)

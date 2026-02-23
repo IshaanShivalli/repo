@@ -54,7 +54,6 @@ class BlockType:
     REDSTONE_ORE   = "redstone_ore"
     LAPIS_ORE      = "lapis_ore"
     WATER          = "water"
-    TORCH          = "torch"
     GLASS          = "glass"
     CRAFTING_TABLE = "crafting_table"
     FURNACE        = "furnace"
@@ -215,14 +214,6 @@ BLOCK_DATA = {
         "texture_side":   f"{TEX_BASE}/water_flow.png",
         "texture_bottom": f"{TEX_BASE}/water_still.png",
         "solid":       False, "transparent": True, "drops": None,
-    },
-    BlockType.TORCH: {
-        "color":       color.rgb(255, 200, 90),
-        "texture":     f"{TEX_BASE}/torch.png",
-        "solid":       False,
-        "transparent": True,
-        "cross":       True,
-        "drops":       BlockType.TORCH,
     },
     BlockType.GLASS: {
         "color":       color.rgba(180, 220, 240, 100),
