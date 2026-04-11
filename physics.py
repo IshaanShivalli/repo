@@ -37,8 +37,8 @@ WATER_SURFACE_JUMP   =  8.0
 
 # Breathing
 AIR_MAX              = 10.0      # seconds (= 10 bubble icons)
-DROWN_DAMAGE_RATE    =  1.0      # HP per second when air depleted
-AIR_REFILL_TIME      =  1.5      # seconds to fully refill air bar on surface
+DROWN_DAMAGE_RATE    = 10.0      # HP per second when air depleted
+AIR_REFILL_TIME      = 1.5      # seconds to fully refill air bar on surface
 
 # ── Block classification helpers ─────────────────────────────────────────────
 

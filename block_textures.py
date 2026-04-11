@@ -210,9 +210,9 @@ BLOCK_DATA = {
     BlockType.LAPIS_ORE:    {"color": color.rgb(60,80,180),  "texture": f"{TEX_BASE}/lapis_ore.png",    "solid": True, "drops": "lapis"},
 
     BlockType.WATER: {
-        "color":          color.rgba(55, 100, 200, 180),
+        "color":          color.rgba(60, 130, 230, 140),   # Slightly more vibrant
         "texture_top":    f"{TEX_BASE}/water_still.png",
-        "texture_side":   f"{TEX_BASE}/water_flow.png",
+        "texture_side":   f"{TEX_BASE}/water_still.png",
         "texture_bottom": f"{TEX_BASE}/water_still.png",
         "solid":       False, "transparent": True, "drops": None,
     },

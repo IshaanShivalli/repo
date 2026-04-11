@@ -73,6 +73,8 @@ _BT_LIST = [
     BlockType.OAK_LOG,
     BlockType.OAK_LEAVES,
     BlockType.SPRUCE_LOG,
+    BlockType.BIRCH_LOG,
+    BlockType.BIRCH_LEAVES,
     BlockType.SPRUCE_LEAVES,
     BlockType.OAK_PLANKS,
     BlockType.COAL_ORE,
@@ -119,6 +121,13 @@ for _i, _bt in enumerate(_BT_LIST):
         for _f in _faces:
             if 0 <= _f < 6:
                 BT_ROT[_i, _f] = _dir
+    # Fix log texture orientation - logs should have vertical grain on sides
+    if _bt in (BlockType.OAK_LOG, BlockType.BIRCH_LOG, BlockType.SPRUCE_LOG):
+        # Face 2,3,4,5 = sides. Rotate UV by -1 (counter-clockwise) or 1 depending on your texture
+        BT_ROT[_i, 2] = -1   # front/back
+        BT_ROT[_i, 3] = -1   # left/right etc.
+        BT_ROT[_i, 4] = -1
+        BT_ROT[_i, 5] = -1
 
 # ── Occlusion mask ───────────────────────────────────────────────────────────
 # Only truly opaque solid blocks should hide their neighbour's faces.

@@ -15,11 +15,11 @@ from block_textures import BlockType
 from settings import (
     CHUNK_SIZE, CHUNK_HEIGHT, N_BLOCK_TYPES, _BT_LIST,
     BT_SOLID, BT_HIT, EYE_OFFSET, PLAYER_HEIGHT, PLAYER_SPEED,
-    GRAVITY, JUMP_VEL, MOUSE_SENS, _lookat,
+    GRAVITY, JUMP_VEL, MOUSE_SENS, _lookat, SEA_LEVEL
 )
 from physics import (
     AIR_MAX, probe_water, update_breathing, apply_water_physics,
-    block_is_water, block_is_swimmable,
+    block_is_water, block_is_swimmable, DROWN_DAMAGE_RATE, AIR_REFILL_TIME,
 )
 from terrain import _terrain_height
 
@@ -58,17 +58,59 @@ class Player:
         self.crouching     = False
         self.sprint_timer  = 0.0   # double-tap W detection
         self.w_tap_time    = 0.0   # time of last W tap
+        self.death_msg_time = 0.0
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
     def take_damage(self, amt: float) -> None:
         if self.inv_time <= 0:
-            self.health   = max(0.0, self.health - amt)
+            self.health = max(0.0, self.health - amt)
             self.inv_time = 0.5
-            if self.health <= 0:
-                self.health         = self.max_health
-                self.death_msg_time = 2.0
-
+            if self.health <= 0.0:
+                self.die()          # ← This line is important
+    def die(self):
+        """Handle death and safe respawn."""
+        print(f"💀 You died at ({self.x:.1f}, {self.y:.1f}, {self.z:.1f})")
+        
+        # Reset stats
+        self.health = self.max_health
+        self.hunger = self.max_hunger
+        self.saturation = 5.0
+        self.air = AIR_MAX
+        self.fall_dist = 0.0
+        self.vx = self.vy = self.vz = 0.0
+        
+        # Safe respawn
+        spawn_x = CHUNK_SIZE // 2 + 0.5
+        spawn_z = CHUNK_SIZE // 2 + 0.5
+        spawn_y = self._find_safe_spawn_y(spawn_x, spawn_z)
+        
+        self.x = float(spawn_x)
+        self.y = float(spawn_y + 1.0)
+        self.z = float(spawn_z)
+        
+        self.death_msg_time = 3.0  # Show message for 3 seconds
+        print(f"♻️ Respawned at ({self.x:.1f}, {self.y:.1f}, {self.z:.1f})")
+    
+    def _find_safe_spawn_y(self, wx: float, wz: float) -> int:
+        """Find a safe Y position on solid ground, never in water."""
+        if not hasattr(self, 'world') or self.world is None:
+            # Fallback if world not attached yet
+            return SEA_LEVEL + 8
+        
+        # Start from surface and go up until we find solid non-water block
+        y = self.world.surface_y(int(wx), int(wz)) + 1
+        
+        for _ in range(40):  # safety limit to prevent infinite loop
+            bt_id = self.world.get_block(int(wx), y, int(wz))
+            if bt_id > 0 and _BT_LIST[bt_id] != BlockType.WATER:
+                # Check block above is air (so we can stand)
+                if self.world.get_block(int(wx), y + 1, int(wz)) == 0:
+                    return y
+            y += 1
+        
+        # Ultimate fallback - above sea level
+        return SEA_LEVEL + 8
     def eye(self) -> tuple:
         # Crouch lowers eye height by 0.4 blocks
         offset = EYE_OFFSET - 0.4 if self.crouching else EYE_OFFSET
@@ -121,10 +163,13 @@ class Player:
         )
 
         # Breathing (physics.py handles damage)
-        self.air = update_breathing(
-            self.air, self.head_in_water, dt,
-            self.game_mode, self.take_damage,
-        )
+        if self.head_in_water:
+            self.air = max(0.0, self.air - dt)
+            if self.air <= 0.0 and self.game_mode == "survival":
+                self.take_damage(DROWN_DAMAGE_RATE * dt)   # Direct damage every frame
+        else:
+            # Refill air on surface
+            self.air = min(AIR_MAX, self.air + dt * (AIR_MAX / AIR_REFILL_TIME))
 
         # Smooth display value – lerp toward real air quickly but not instantly
         # This eliminates the single-frame flicker when crossing the surface.

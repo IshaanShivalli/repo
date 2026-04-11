@@ -65,8 +65,8 @@ def river_info(wx: int, wz: int, height: int, seed: int) -> int:
     Only columns where terrain height > RIVER_Y get carved — columns
     already below RIVER_Y are skipped (no floating water possible).
     """
-    FREQ = 0.010  # noise frequency — lower = fewer rivers, wider spacing
-    BAND = 0.030  # zero-crossing band width — narrower rivers
+    FREQ = 0.009   # make rivers rarer and wider
+    BAND = 0.045   
 
     v = _grad_noise(float(wx) * FREQ, float(wz) * FREQ * 0.8, seed ^ 0x52AB)
 

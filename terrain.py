@@ -2,11 +2,12 @@
 terrain.py  –  Numba-JIT terrain generation (gen_chunk) and chunk mesh builder.
 
 Biomes:
-  0 = plains      (grass, oak trees)
-  1 = forest      (grass, dense oak trees)
-  2 = desert      (sand, cactus)
-  3 = snowy taiga (snow, spruce trees)
-  4 = ocean       (deep water, sand floor, kelp, seagrass)
+  0 = plains        (grass, scattered oak trees)
+  1 = forest        (grass, dense oak trees, tall oaks)
+  2 = desert        (sand, red sand patches, cactus)
+  3 = snowy taiga   (snow, spruce trees, stone peaks)
+  4 = ocean         (deep water, sand floor, kelp, seagrass)
+  5 = birch forest  (grass ground, dense birch trees)
 """
 
 import math
@@ -23,49 +24,107 @@ from inland_water import river_info, river_depth, carve_river
 # ═══════════════════════════════════════════════════════════════════════
 
 @njit(cache=True)
+def _hash(x: int, z: int, seed: int) -> float:
+    """Fast integer hash → float in [-1, 1]."""
+    n = (x * 1664525 + z * 1013904223 + seed) & 0xFFFFFFFF
+    n ^= (n >> 16)
+    n = (n * 0x45d9f3b) & 0xFFFFFFFF
+    n ^= (n >> 16)
+    return (n / 0x7FFFFFFF) - 1.0
+
+
+@njit(cache=True)
+def _smooth(t: float) -> float:
+    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+
+
+@njit(cache=True)
+def _vn(x: float, z: float, seed: int) -> float:
+    """Value noise, returns [-1, 1]."""
+    ix = int(math.floor(x)); iz = int(math.floor(z))
+    fx = x - float(ix);     fz = z - float(iz)
+    ux = _smooth(fx);       uz = _smooth(fz)
+    v00 = _hash(ix,   iz,   seed)
+    v10 = _hash(ix+1, iz,   seed)
+    v01 = _hash(ix,   iz+1, seed)
+    v11 = _hash(ix+1, iz+1, seed)
+    a = v00 + ux * (v10 - v00)
+    b = v01 + ux * (v11 - v01)
+    return a + uz * (b - a)
+
+
+@njit(cache=True)
+def _fbm(x: float, z: float, seed: int, octaves: int,
+         lacunarity: float, gain: float) -> float:
+    """Fractal Brownian Motion — layered value noise."""
+    v = 0.0; amp = 0.5; freq = 1.0
+    for _ in range(octaves):
+        v   += _vn(x * freq, z * freq, seed) * amp
+        freq *= lacunarity
+        amp  *= gain
+        seed  = (seed * 1664525 + 1013904223) & 0xFFFFFFFF
+    return v
+
+
+@njit(cache=True)
 def _noise2(x: float, z: float, seed: int) -> float:
-    a = math.sin(x * 0.08 + seed * 1e-9) * math.cos(z * 0.08 + seed * 1e-9)
-    b = math.sin(x * 0.21 + seed * 2e-9) * math.cos(z * 0.17 + seed * 2e-9)
-    return a * 0.7 + b * 0.3
+    """Legacy 2-D noise wrapper (kept for biome blending)."""
+    return _vn(x, z, seed)
 
 
 @njit(cache=True)
 def _noise3(x: float, y: float, z: float, seed: int) -> float:
-    # Multi-octave 3-D noise for natural, varied cave shapes
-    n  = (math.sin(x * 0.12 + seed * 1e-9) *
-          math.cos(z * 0.12 + seed * 1e-9) *
-          math.sin(y * 0.18 + seed * 2e-9))
-    n2 = (math.sin(x * 0.07 + seed * 3e-9) *
-          math.cos(z * 0.09 + seed * 4e-9) *
-          math.cos(y * 0.11 + seed * 5e-9)) * 0.6
-    n3 = (math.sin(x * 0.23 + seed * 6e-9) *
-          math.cos(z * 0.19 + seed * 7e-9) *
-          math.sin(y * 0.27 + seed * 8e-9)) * 0.3
-    return n + n2 + n3
+    """3-D value noise for cave carving."""
+    # XZ slice
+    n1 = _vn(x * 0.08 + seed * 1e-9, z * 0.08 + seed * 2e-9, seed)
+    # YZ slice (different seed offset)
+    n2 = _vn(y * 0.12 + seed * 3e-9, z * 0.12 + seed * 4e-9, seed ^ 0xAB12)
+    # XY slice
+    n3 = _vn(x * 0.10 + seed * 5e-9, y * 0.10 + seed * 6e-9, seed ^ 0xCD34)
+    return (n1 + n2 + n3) / 3.0
 
 
 @njit(cache=True)
 def _cave_noise_v(x: float, y: float, z: float, seed: int) -> float:
-    """Secondary vertical-tunnel noise — creates shafts that reach the surface."""
-    a = math.sin(x * 0.15 + seed * 9e-9) * math.cos(z * 0.15 + seed * 1e-8)
-    b = math.sin(x * 0.08 + seed * 1.1e-8) * math.cos(z * 0.08 + seed * 1.2e-8)
-    # Y-independent: same value for a whole column → long vertical shaft
+    """Secondary vertical-tunnel noise."""
+    a = _vn(x * 0.06, z * 0.06, seed ^ 0x9911)
+    b = _vn(x * 0.03, z * 0.03, seed ^ 0x2233)
     return a * 0.6 + b * 0.4
 
 
 @njit(cache=True)
 def _continent(wx: int, wz: int, seed: int) -> float:
     """Large-scale continent value: negative = ocean, positive = land."""
-    return (_noise2(float(wx) * 0.006, float(wz) * 0.006, seed ^ 0x1234) +
-            _noise2(float(wx) * 0.002, float(wz) * 0.002, seed ^ 0x5678) * 0.5)
+    wx_f = float(wx); wz_f = float(wz)
+    warp_x = _fbm(wx_f * 0.003 + 1.7, wz_f * 0.003,       seed ^ 0x1111, 3, 2.0, 0.5) * 40.0
+    warp_z = _fbm(wx_f * 0.003,       wz_f * 0.003 + 9.2, seed ^ 0x2222, 3, 2.0, 0.5) * 40.0
+    return _fbm((wx_f + warp_x) * 0.005, (wz_f + warp_z) * 0.005,
+                seed ^ 0x3333, 4, 2.0, 0.5)
+
+# Change this line in _biome_at:
 
 
 @njit(cache=True)
 def _terrain_height(wx: int, wz: int, seed: int) -> int:
-    n     = _noise2(float(wx), float(wz), seed)
-    hills = (math.sin(float(wx) * 0.01 + seed * 1e-9) *
-             math.cos(float(wz) * 0.01 + seed * 2e-9))
-    h = SEA_LEVEL + 5 + int(n * 8 + hills * 4)
+    wx_f = float(wx); wz_f = float(wz)
+
+    # Domain warp for dramatic terrain variation
+    warp_x = _fbm(wx_f * 0.008 + 3.1, wz_f * 0.008,       seed ^ 0xAAAA, 2, 2.0, 0.5) * 25.0
+    warp_z = _fbm(wx_f * 0.008,       wz_f * 0.008 + 7.4,  seed ^ 0xBBBB, 2, 2.0, 0.5) * 25.0
+    wx_w = wx_f + warp_x; wz_w = wz_f + warp_z
+
+    # Base large-scale shape
+    base   = _fbm(wx_w * 0.012, wz_w * 0.012, seed ^ 0xCC00, 5, 2.1, 0.48)
+    # Mid-frequency hills
+    hills  = _fbm(wx_w * 0.035, wz_w * 0.035, seed ^ 0xDD00, 4, 2.0, 0.50) * 0.4
+    # Fine detail
+    detail = _fbm(wx_w * 0.09,  wz_w * 0.09,  seed ^ 0xEE00, 3, 2.0, 0.45) * 0.15
+    # Ridge noise for mountain ridges
+    ridge_raw = abs(_fbm(wx_w * 0.018, wz_w * 0.018, seed ^ 0xFF00, 4, 2.0, 0.55))
+    ridge = (1.0 - ridge_raw) * (1.0 - ridge_raw) * 0.5
+
+    combined = base + hills + detail + ridge
+    h = SEA_LEVEL + 6 + int(combined * 20.0)
     return max(BEDROCK_LEVEL + 3, min(CHUNK_HEIGHT - 4, h))
 
 
@@ -73,38 +132,53 @@ def _terrain_height(wx: int, wz: int, seed: int) -> int:
 def _biome_at(wx: int, wz: int, seed: int) -> int:
     """
     Returns biome index:
-      0 = plains  1 = forest  2 = desert  3 = snowy taiga  4 = ocean
+      0 = plains   1 = forest   2 = desert   3 = snowy taiga
+      4 = ocean    5 = birch forest
     """
-    if _continent(wx, wz, seed) < -0.45:
+    if _continent(wx, wz, seed) < -0.08:   # ← changed from -0.20 to -0.08
         return 4   # ocean
-    v = _noise2(float(wx) * 0.03, float(wz) * 0.03, seed)
-    if v < -0.3: return 2   # desert
-    if v <  0.2: return 0   # plains
-    if v <  0.5: return 1   # forest
-    # Snowy taiga only at high elevation
+
+    # Temperature noise (smooth, large scale)
+    temp  = _fbm(float(wx) * 0.018, float(wz) * 0.018, seed ^ 0x5A5A, 3, 2.0, 0.5)
+    # Humidity noise (different frequency/seed)
+    humid = _fbm(float(wx) * 0.022, float(wz) * 0.022, seed ^ 0xA5A5, 3, 2.0, 0.5)
+
     h = _terrain_height(wx, wz, seed)
-    if h >= SEA_LEVEL + 18: return 3  # snowy taiga (high ground only)
-    return 1                 # forest instead of snow at low elevation
+
+    # Very high peaks → snowy taiga regardless
+    if h >= SEA_LEVEL + 22:
+        return 3
+
+    if temp < -0.25:
+        return 3   # cold → snowy taiga
+
+    if temp > 0.30:
+        return 2   # hot → desert
+
+    # Temperate zone — split by humidity
+    if humid > 0.25:
+        return 5   # wet → birch forest
+    if humid > -0.10:
+        return 1   # moderate → oak forest
+    return 0       # dry → plains
 
 
 @njit(cache=True)
 def _is_coast(wx: int, wz: int, seed: int) -> bool:
-    """True when a land cell is close to the ocean boundary (within ~6 blocks)."""
+    """True when a land cell is close to the ocean boundary."""
     c = _continent(wx, wz, seed)
-    if c < -0.45:
-        return False   # already ocean
-    # Sample a small neighbourhood; if any neighbour is ocean we're at the coast
-    for ddx in (-6, -3, 0, 3, 6):
-        for ddz in (-6, -3, 0, 3, 6):
-            if _continent(wx + ddx, wz + ddz, seed) < -0.45:
+    if c < -0.20:
+        return False
+    for ddx in (-5, -2, 0, 2, 5):
+        for ddz in (-5, -2, 0, 2, 5):
+            if _continent(wx + ddx, wz + ddz, seed) < -0.20:
                 return True
     return False
 
 
 @njit(cache=True)
 def ocean_floor_height(wx: int, wz: int, seed: int) -> int:
-    """Varied ocean floor between OCEAN_FLOOR and SEA_LEVEL-4."""
-    n = _noise2(float(wx) * 0.05, float(wz) * 0.05, seed ^ 0xABCD)
+    n = _vn(float(wx) * 0.05, float(wz) * 0.05, seed ^ 0xABCD)
     h = OCEAN_FLOOR + int((n * 0.5 + 0.5) * (SEA_LEVEL - 6 - OCEAN_FLOOR))
     return max(OCEAN_FLOOR, min(SEA_LEVEL - 6, h))
 
@@ -120,7 +194,8 @@ def gen_chunk(cx: int, cz: int, seed: int,
               ID_WATER: int, ID_LOG: int, ID_LEAVES: int,
               ID_SPRUCE_LOG: int, ID_SPRUCE_LEAVES: int, ID_CACTUS: int,
               ID_COAL: int, ID_IRON: int, ID_GOLD: int, ID_DIAMOND: int,
-              ID_SAND_OCEAN: int, ID_KELP: int, ID_SEAGRASS: int) -> np.ndarray:
+              ID_SAND_OCEAN: int, ID_KELP: int, ID_SEAGRASS: int,
+              ID_BIRCH_LOG: int, ID_BIRCH_LEAVES: int) -> np.ndarray:
     S   = CHUNK_SIZE
     H   = CHUNK_HEIGHT
     blk = np.zeros((S, H, S), dtype=np.uint8)
@@ -132,13 +207,11 @@ def gen_chunk(cx: int, cz: int, seed: int,
             wz    = cz * S + dz
             biome = _biome_at(wx, wz, seed)
 
-                        # ── Ocean biome (see water_gen.py) ───────────────────
+            # ── Ocean ────────────────────────────────────────────────────
             if biome == 4:
                 lcg = fill_ocean_column(blk, dx, dz, wx, wz, seed, lcg,
                     ID_BEDROCK, ID_STONE, ID_SAND_OCEAN, ID_WATER)
-
-                # Ore pockets in ocean stone
-                floor_y = ocean_floor_height(wx, wz, seed)  # recompute for ores
+                floor_y = ocean_floor_height(wx, wz, seed)
                 for _ in range(3):
                     lcg = (lcg * 1664525 + 1013904223) & 0xFFFFFFFF
                     oy  = BEDROCK_LEVEL + 3 + int(lcg & 0x1F)
@@ -148,16 +221,14 @@ def gen_chunk(cx: int, cz: int, seed: int,
                         rv  = lcg & 0xFF
                         if   rv < 20: blk[dx, oy, dz] = ID_COAL
                         elif rv < 32: blk[dx, oy, dz] = ID_IRON
-                        elif rv < 35 and oy < SEA_LEVEL - 8: blk[dx, oy, dz] = ID_GOLD
+                        elif rv < 35 and oy < SEA_LEVEL - 8:  blk[dx, oy, dz] = ID_GOLD
                         elif rv < 37 and oy < SEA_LEVEL - 16: blk[dx, oy, dz] = ID_DIAMOND
                 continue
 
             # ── Land biomes ──────────────────────────────────────────────
             height = _terrain_height(wx, wz, seed)
-            # Coast detection: land cells within ~6 blocks of ocean get sand
-            # surface and subsurface, regardless of biome.
-            coast = _is_coast(wx, wz, seed)
-            # River carving (inland_water.py)
+            coast  = _is_coast(wx, wz, seed)
+
             _river_y = -1
             if biome not in (2, 3) and not coast:
                 _river_y = river_info(wx, wz, height, seed)
@@ -167,14 +238,11 @@ def gen_chunk(cx: int, cz: int, seed: int,
             elif biome == 2:
                 surf = ID_SAND
             elif biome == 3:
-                # High peaks: stone only above certain height
-                if height >= SEA_LEVEL + 28:
-                    surf = ID_STONE
-                else:
-                    surf = ID_SNOW
+                surf = ID_STONE if height >= SEA_LEVEL + 22 else ID_SNOW
             else:
-                surf = ID_GRASS
+                surf = ID_GRASS   # plains, forest, birch forest all use grass
 
+            # ── Column fill ───────────────────────────────────────────────
             for y in range(H):
                 if y <= BEDROCK_LEVEL:
                     blk[dx, y, dz] = ID_BEDROCK
@@ -184,71 +252,72 @@ def gen_chunk(cx: int, cz: int, seed: int,
                 elif y < height - 3:
                     blk[dx, y, dz] = ID_STONE
                 elif y < height:
-                    # Coast: sand; high snow peaks: stone; else dirt
                     if coast:
                         blk[dx, y, dz] = ID_SAND
-                    elif biome == 3 and height >= SEA_LEVEL + 28:
+                    elif biome == 2:
+                        blk[dx, y, dz] = ID_SAND
+                    elif biome == 3 and height >= SEA_LEVEL + 22:
                         blk[dx, y, dz] = ID_STONE
                     else:
                         blk[dx, y, dz] = ID_DIRT
                 elif y == height:
                     blk[dx, y, dz] = surf
 
-            # ── Cave carving (land only) ──────────────────────────────────
-            # Big irregular chambers: low threshold on combined multi-octave noise.
-            # Vertical shaft noise: columns where shaft_v > threshold become open
-            # from BEDROCK up to near the surface, creating sky-shafts / ravines.
-            shaft_v = _cave_noise_v(float(wx), 0.0, float(wz), seed)
-            is_shaft = shaft_v > 0.60   # ~10% of columns get a shaft
+            # ── Cave carving ──────────────────────────────────────────────
+            # Spaghetti caves: two noise fields — carve where both are near 0
+            # (their product creates thin worm-like tubes)
+            for y in range(BEDROCK_LEVEL + 3, height - 1):
+                fy = float(y); fx = float(wx); fz = float(wz)
 
-            # Some caves are big (25% chance per column)
-            big_cave = _noise2(float(wx) * 0.07, float(wz) * 0.07, seed ^ 0xC4FE) > 0.5
-            cave_thresh = 0.36 if big_cave else 0.44
-            # Cave opening: near-surface shaft that breaks through to sky
-            opening_noise = _noise2(float(wx) * 0.15, float(wz) * 0.15, seed ^ 0xABCD)
-            has_opening = opening_noise > 0.72
-
-            for y in range(BEDROCK_LEVEL + 3, height):
-                cv = _noise3(float(wx), float(y), float(wz), seed)
-                if cv > cave_thresh:
+                # Spaghetti worm caves (main cave network)
+                n1 = _noise3(fx * 1.0, fy * 1.0, fz * 1.0, seed ^ 0x1122)
+                n2 = _noise3(fx * 1.0, fy * 1.0, fz * 1.0, seed ^ 0x3344)
+                if n1 * n1 + n2 * n2 < 0.04:   # thin tubes where both near 0
                     blk[dx, y, dz] = 0
                     continue
-                # Cave opening: carve from surface down 8 blocks in opening columns
-                if has_opening and y >= height - 8 and y < height:
-                    open_cv = _noise3(float(wx), float(y), float(wz), seed ^ 0x77)
-                    if open_cv > 0.35:
+
+                # Big chambers: single-field threshold (20% more open than before)
+                n3 = _noise3(fx * 0.6, fy * 0.7, fz * 0.6, seed ^ 0x5566)
+                big = _vn(fx * 0.05, fz * 0.05, seed ^ 0x7788) > 0.3
+                thresh = 0.30 if big else 0.40
+                if n3 > thresh:
+                    blk[dx, y, dz] = 0
+                    continue
+
+                # Vertical shafts (ravine-style, ~8% of columns)
+                shaft_v = _cave_noise_v(fx, fy, fz, seed)
+                if shaft_v > 0.58 and y > 10:
+                    shaft_w = _vn(fx * 0.25, fz * 0.25, seed ^ 0x9900)
+                    if shaft_w > 0.10:
                         blk[dx, y, dz] = 0
                         continue
 
-                # Vertical shaft: narrow column carved from deep up toward surface.
-                # Only activate above y=10 so we don't punch through bedrock.
-                if is_shaft and y > 10:
-                    # Shaft width varies with a slow horizontal noise
-                    shaft_w = _noise2(float(wx) * 0.3, float(wz) * 0.3, seed ^ 0xCAFE)
-                    # shaft_w in [-1,1]; only carve when it's above 0.15 (medium-wide shafts)
-                    if shaft_w > 0.15:
+                # Near-surface cave openings
+                if y >= height - 10:
+                    open_n = _noise3(fx, fy, fz, seed ^ 0xBBCC)
+                    if open_n > 0.32:
                         blk[dx, y, dz] = 0
 
-            # River carving — applied AFTER terrain y-loop
+            # River carving
             if _river_y > 0:
                 _river_d = river_depth(wx, wz, seed)
                 carve_river(blk, dx, dz, height, _river_y, _river_d,
                             ID_WATER, ID_DIRT, H)
 
-            # Ore placement
-            for _ in range(4):
+            # Ore placement (more variety — 6 attempts per column)
+            for _ in range(6):
                 lcg = (lcg * 1664525 + 1013904223) & 0xFFFFFFFF
-                oy  = BEDROCK_LEVEL + 3 + int(lcg & 0x1F)
-                oy  = min(oy, height - 4)
+                oy  = BEDROCK_LEVEL + 3 + int(lcg & 0x3F) % (height - BEDROCK_LEVEL - 6)
+                oy  = max(BEDROCK_LEVEL + 3, min(oy, height - 4))
                 if blk[dx, oy, dz] == ID_STONE:
                     lcg = (lcg * 1664525 + 1013904223) & 0xFFFFFFFF
                     rv  = lcg & 0xFF
-                    if   rv < 16: blk[dx, oy, dz] = ID_COAL
-                    elif rv < 28: blk[dx, oy, dz] = ID_IRON
-                    elif rv < 31 and oy < SEA_LEVEL - 8:  blk[dx, oy, dz] = ID_GOLD
-                    elif rv < 33 and oy < SEA_LEVEL - 16: blk[dx, oy, dz] = ID_DIAMOND
+                    if   rv < 18: blk[dx, oy, dz] = ID_COAL
+                    elif rv < 30: blk[dx, oy, dz] = ID_IRON
+                    elif rv < 33 and oy < SEA_LEVEL - 6:  blk[dx, oy, dz] = ID_GOLD
+                    elif rv < 35 and oy < SEA_LEVEL - 14: blk[dx, oy, dz] = ID_DIAMOND
 
-    # ── Surface features: trees, cactus, kelp, seagrass ─────────────────────
+    # ── Surface features ─────────────────────────────────────────────────────
     for dx in range(2, S - 3):
         for dz in range(2, S - 3):
             wx    = cx * S + dx
@@ -256,81 +325,72 @@ def gen_chunk(cx: int, cz: int, seed: int,
             biome = _biome_at(wx, wz, seed)
             lcg   = (lcg * 1664525 + 1013904223) & 0xFFFFFFFF
 
-            # ── Ocean underwater plants (see water_gen.py) ────────────
             if biome == 4:
                 lcg = place_ocean_plants(blk, dx, dz, wx, wz, seed, lcg,
                     ID_WATER, ID_KELP, ID_SEAGRASS)
 
-            # ── Land surface features ────────────────────────────────────────
             h  = _terrain_height(wx, wz, seed)
             ty = h + 1
             if ty + 7 >= H: continue
-
-            # No trees or cactus on coastal sand, water, or submerged terrain
             if _is_coast(wx, wz, seed): continue
             if h <= SEA_LEVEL: continue
             if blk[dx, h, dz] == ID_WATER: continue
-            # No surface features on rivers
             if river_info(wx, wz, h, seed) > 0: continue
 
             # Desert cactus
             if biome == 2:
                 if blk[dx, h, dz] != ID_SAND: continue
-                if (lcg & 0xFF) >= 10: continue
+                if (lcg & 0xFF) >= 12: continue
                 cact_h = 2 + (lcg & 0x3)
                 for y in range(ty, min(ty + cact_h, H)):
                     blk[dx, y, dz] = ID_CACTUS
                 continue
 
-            # Oak tree (plains / forest)
+            # Oak trees (plains / forest)
             if biome in (0, 1):
-                thresh = 4 if biome == 1 else 2
+                thresh = 5 if biome == 1 else 2
                 if (lcg & 0xFF) >= thresh: continue
-                for y in range(ty, ty + 5):
-                    if 0 <= dx < S and 0 <= dz < S:
-                        blk[dx, y, dz] = ID_LOG
-                for ldy in range(4, 8):
-                    for ldx in range(-3, 4):
-                        for ldz in range(-3, 4):
-                            if abs(ldx) + abs(ldz) <= 4:
+                trunk_h = 4 + (lcg & 0x3)   # variable trunk height 4-7
+                for y in range(ty, min(ty + trunk_h, H)):
+                    blk[dx, y, dz] = ID_LOG
+                for ldy in range(trunk_h - 2, trunk_h + 3):
+                    radius = 3 if ldy < trunk_h else 2
+                    for ldx in range(-radius, radius + 1):
+                        for ldz in range(-radius, radius + 1):
+                            if abs(ldx) + abs(ldz) <= radius + 1:
                                 lx_ = dx + ldx; lz_ = dz + ldz; ly_ = ty + ldy
                                 if 0 <= lx_ < S and 0 <= lz_ < S and ly_ < H:
                                     if blk[lx_, ly_, lz_] == 0:
                                         blk[lx_, ly_, lz_] = ID_LEAVES
                 continue
 
-            # Tall oak tree (rare, forest biome only)
-            if biome == 1:
-                if (lcg & 0xFF) != 0: pass  # ~0.4% chance
-                else:
-                    # 4-wide trunk, 20 blocks tall
-                    for y in range(ty, ty + 20):
-                        for tx in range(dx, dx + 4):
-                            for tz in range(dz, dz + 4):
-                                if 0 <= tx < S and 0 <= tz < S and y < H:
-                                    blk[tx, y, tz] = ID_LOG
-                    # Big canopy at top
-                    for ldy in range(16, 24):
-                        radius = 6 - max(0, ldy - 20)
-                        for ldx in range(-radius, radius + 1):
-                            for ldz in range(-radius, radius + 1):
-                                if ldx*ldx + ldz*ldz <= (radius+1)*(radius+1):
-                                    lx_ = dx + 2 + ldx
-                                    lz_ = dz + 2 + ldz
-                                    ly_ = ty + ldy
-                                    if 0<=lx_<S and 0<=lz_<S and ly_<H:
-                                        if blk[lx_, ly_, lz_] == 0:
-                                            blk[lx_, ly_, lz_] = ID_LEAVES
-                    continue
+            # Birch trees (birch forest biome)
+            if biome == 5:
+                if (lcg & 0xFF) >= 8: continue   # dense birch
+                trunk_h = 5 + (lcg & 0x3)        # birch is taller: 5-8
+                for y in range(ty, min(ty + trunk_h, H)):
+                    blk[dx, y, dz] = ID_BIRCH_LOG
+                # Birch canopy: smaller, more oval than oak
+                for ldy in range(trunk_h - 2, trunk_h + 2):
+                    radius = 2 if ldy < trunk_h else 1
+                    for ldx in range(-radius, radius + 1):
+                        for ldz in range(-radius, radius + 1):
+                            if abs(ldx) + abs(ldz) <= radius + 1:
+                                lx_ = dx + ldx; lz_ = dz + ldz; ly_ = ty + ldy
+                                if 0 <= lx_ < S and 0 <= lz_ < S and ly_ < H:
+                                    if blk[lx_, ly_, lz_] == 0:
+                                        blk[lx_, ly_, lz_] = ID_BIRCH_LEAVES
+                continue
 
-            # Spruce tree (snowy taiga) - not on stone peaks
+            # Spruce trees (snowy taiga)
             if biome == 3:
-                if height >= SEA_LEVEL + 28: continue  # stone peak, no trees
-                if (lcg & 0xFF) >= 3: continue
-                for y in range(ty, ty + 6):
-                    if 0 <= y < H: blk[dx, y, dz] = ID_SPRUCE_LOG
-                for ldy in range(3, 8):
-                    radius = max(1, 4 - (ldy - 3))
+                if height >= SEA_LEVEL + 22: continue
+                if (lcg & 0xFF) >= 4: continue
+                trunk_h = 6 + (lcg & 0x3)
+                for y in range(ty, min(ty + trunk_h, H)):
+                    blk[dx, y, dz] = ID_SPRUCE_LOG
+                for ldy in range(2, trunk_h + 1):
+                    radius = max(1, 3 - (ldy * 2 // trunk_h))
                     for ldx in range(-radius, radius + 1):
                         for ldz in range(-radius, radius + 1):
                             if abs(ldx) + abs(ldz) <= radius + 1:

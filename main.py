@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 main.py  –  Entry point.  Wires together settings, terrain, player and all
              the rendering / UI code.
@@ -20,8 +21,9 @@ import pyglet
 import pyglet.gl as gl
 from pyglet.window import key, mouse
 import moderngl
-
-# ── project modules ───────────────────────────────────────────────────────────
+import numba
+numba.config.DISABLE_JIT = False  
+numba.config.CACHE = False
 from block_textures import BlockType, BLOCK_DATA, HEART_TEX, BUBBLE_FRAMES
 from inventory_system import PlayerInventorySystem, ItemType, FOOD_DATA, SHAPED_RECIPES, FURNACE_RECIPES, FUEL_DATA
 from mobs import MobManager, MobType, Vec3 as MobVec3
@@ -82,46 +84,67 @@ void main() {
 
 WATER_VERT = """
 #version 330 core
-in vec3 in_pos; in vec3 in_normal; in vec4 in_color; in vec2 in_uv;
+in vec3 in_pos;
+in vec3 in_normal;
+in vec4 in_color;
+in vec2 in_uv;
 uniform mat4 u_mvp;
 uniform float u_time;
-out vec4 v_color; out vec3 v_normal; out vec2 v_uv; out float v_flow; out float v_is_water;
+out vec4 v_color;
+out vec3 v_normal;
+out vec2 v_uv;
+out float v_is_water;
+
 void main() {
     gl_Position = u_mvp * vec4(in_pos, 1.0);
     v_color  = in_color;
     v_normal = in_normal;
-    // Flow direction: scroll UV downhill (negative Y in texture = downstream)
-    // Use world XZ position to determine flow direction per-vertex
-    float flow_speed = 0.18;
+    
     v_is_water = step(0.5, v_color.b - max(v_color.r, v_color.g) + 0.5);
-    v_uv = in_uv + vec2(0.0, u_time * flow_speed * v_is_water);
-    v_flow = u_time * v_is_water;
+    
+    float flow_speed = 0.04;   // very slow and calm
+    
+    vec2 offset = vec2(0.0);
+    if (v_is_water > 0.5) {
+        if (abs(in_normal.y) > 0.9) {
+            // Top surface: extremely gentle movement (almost still)
+            offset = vec2(u_time * flow_speed * 0.3, u_time * flow_speed * 0.5);
+        } else {
+            // Side faces: slow downward flow only
+            offset = vec2(0.0, u_time * flow_speed * 0.8);
+        }
+    }
+    v_uv = in_uv + offset;
 }
 """
 
 WATER_FRAG = """
 #version 330 core
-in vec4 v_color; in vec3 v_normal; in vec2 v_uv; in float v_flow; in float v_is_water;
-uniform vec3 u_sun; uniform float u_ambient; uniform vec3 u_tint;
+in vec4 v_color;
+in vec3 v_normal;
+in vec2 v_uv;
+in float v_is_water;
+uniform vec3 u_sun;
+uniform float u_ambient;
+uniform vec3 u_tint;
 uniform sampler2D u_tex;
 out vec4 frag_color;
-void main() {
-    vec3 norm = normalize(v_normal);
 
-    vec2 uv1 = v_uv;
-    vec2 uv2 = v_uv * 1.3 + vec2(v_flow * 0.11, -v_flow * 0.07);
-    vec4 t1 = texture(u_tex, uv1);
-    // Only do double-sample animation for water faces
-    vec4 t2 = texture(u_tex, uv2);
-    vec4 texel = mix(t1, mix(t1, t2, 0.45 * v_is_water), v_is_water);
+void main() {
+    vec4 texel = texture(u_tex, v_uv);
     if (texel.a < 0.05) discard;
-    float diff  = max(dot(norm, normalize(u_sun)), 0.0);
+    
+    float diff = max(dot(normalize(v_normal), normalize(u_sun)), 0.0);
     float light = u_ambient + (1.0 - u_ambient) * diff;
-    vec3 rgb    = texel.rgb * v_color.rgb;
-    frag_color  = vec4(rgb * u_tint * light, v_color.a * texel.a);
+    
+    vec3 rgb = texel.rgb * v_color.rgb;
+    
+    // Softer water look with better transparency
+    float alpha = v_color.a * texel.a * 0.78;
+    
+    frag_color = vec4(rgb * u_tint * light, alpha);
 }
 """
-
 SKY_VERT = """
 #version 330 core
 in vec2 in_pos; out float v_y; out vec2 v_pos;
@@ -225,7 +248,9 @@ class World:
                 BT[BlockType.GOLD_ORE],    BT[BlockType.DIAMOND_ORE],
                 # Ocean biome blocks
                 BT[BlockType.SAND_OCEAN],  BT[BlockType.KELP],
-                BT[BlockType.SEAGRASS])
+                BT[BlockType.SEAGRASS],
+                # Birch forest biome
+                BT[BlockType.BIRCH_LOG],   BT[BlockType.BIRCH_LEAVES])
             ch = Chunk(cx, cz, blk)
             self.chunks[k] = ch
             self.dirty_queue.append(ch)
@@ -1766,39 +1791,43 @@ class UIManager:
         if self._mode==self.NONE: self.open_inv()
         else: self.close()
     def tick(self,dt): self._fur_scr.tick(dt,self._win.inventory)
-    def update_hud(self,player,world,fps_buf,dt=0.0):
-        fps=sum(fps_buf)/len(fps_buf) if fps_buf else 0
-        inv=self._win.inventory; sel=inv.slots.selected_item or '—'
-        bid=int(_biome_at(int(player.x),int(player.z),SEED))
-        bname=["Plains","Forest","Desert","Snow Taiga","Ocean"][bid] if 0<=bid<=4 else "?"
-        self._l1.text=(f"FPS {fps:.0f}  |  {world.phase_str()}"
-                       f"  ({int(world.time_of_day/1000):02d}:00)  Biome:{bname}")
-        self._l2.text=(f"XYZ {player.x:.1f} {player.y:.1f} {player.z:.1f}"
-                       f"  Chunks:{len(world.chunks)}")
+    def update_hud(self, player, world, fps_buf, dt=0.0):
+        fps = sum(fps_buf) / len(fps_buf) if fps_buf else 0
+        inv = self._win.inventory
+        sel = inv.slots.selected_item or '—'
+        
+        bid = int(_biome_at(int(player.x), int(player.z), SEED))
+        bname = ["Plains", "Forest", "Desert", "Snow Taiga", "Ocean", "Birch Forest"][bid] if 0 <= bid <= 5 else "?"
+
+        self._l1.text = (f"FPS {fps:.0f} | {world.phase_str()} "
+                        f"({int(world.time_of_day/1000):02d}:00) Biome:{bname}")
+        self._l2.text = (f"XYZ {player.x:.1f} {player.y:.1f} {player.z:.1f} "
+                        f"Chunks:{len(world.chunks)}")
+
         water_str = ""
-        if getattr(player,'head_in_water',False):
-            air_pct = int(getattr(player,'air',10.0) / 10.0 * 100)
-            water_str = f"  🌊 Air:{air_pct}%"
-        elif getattr(player,'in_water',False):
-            water_str = "  🌊 Swimming"
-        self._l3.text=(f"HP {int(player.health)}/20  Hunger {int(player.hunger)}/20"
-                       f"  XP {player.xp}{water_str}")
-        if self.is_open:
-            hint="[ESC/E to close]"
-        elif getattr(player,'in_water',False):
-            hint=f"[{sel}]  WASD=swim  Space=rise  Shift=dive  LMB=mine  RMB=place"
+        if getattr(player, 'head_in_water', False):
+            air_pct = int(getattr(player, 'air', 10.0) / 10.0 * 100)
+            water_str = f" 🌊 Air:{air_pct}%"
+        elif getattr(player, 'in_water', False):
+            water_str = " 🌊 Swimming"
+
+        self._l3.text = (f"HP {int(player.health)}/20 Hunger {int(player.hunger)}/20 "
+                        f"XP {player.xp}{water_str}")
+
+        # Death message takes priority
+        if player.death_msg_time > 0:
+            self._l4.text = "You died! Respawning..."
+            player.death_msg_time = max(0.0, player.death_msg_time - dt)
+        elif self.is_open:
+            self._l4.text = "[ESC/E to close]"
+        elif getattr(player, 'in_water', False):
+            self._l4.text = f"[{sel}] WASD=swim Space=rise Shift=dive LMB=mine RMB=place"
         else:
-            hint=f"[{sel}]  WASD  Space=jump  LMB=mine  RMB=place  1-9=slot  F=eat  E=inv"
-        if not self.is_open:
-            rc = player.raycast(world)
-            if rc:
-                pos, _, _ = rc
-                bt = world.get_block(*pos)
-                name = _pretty_name(bt)
-                if name:
-                    hint = f"{hint}  |  {name}"
-        self._l4.text=hint
-        self._bars.update(player, dt); self._hotbar.refresh(inv)
+            self._l4.text = f"[{sel}] WASD Space=jump LMB=mine RMB=place 1-9=slot F=eat E=inv"
+
+        # Update bars and hotbar
+        self._bars.update(player, dt)
+        self._hotbar.refresh(inv)
     def draw(self):
         self._hb.draw()
         if   self._mode==self.INV:     self._inv_scr.draw()
@@ -2086,6 +2115,7 @@ class UIManager:
                 _,item,_=res
                 if item: return item
         return None
+    
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -2096,12 +2126,12 @@ class GameWindow(pyglet.window.Window):
         cfg = pyglet.gl.Config(major_version=3, minor_version=3,
                                forward_compatible=True, depth_size=24, double_buffer=True)
         super().__init__(WIN_W, WIN_H,
-                         caption="Minecraft-Python  [pyglet · ModernGL · Numba]",
+                         caption="Minecraft-Python [pyglet · ModernGL · Numba]",
                          config=cfg, resizable=True, vsync=False)
+        
         self.ctx = moderngl.create_context()
         self.ren = Renderer(self.ctx)
         self.world = World()
-
         self.inventory = Inventory()
         self.inventory.slots.add(ItemType.WOODEN_PICKAXE, 1)
         self.inventory.slots.add(ItemType.WOODEN_AXE,     1)
@@ -2119,23 +2149,33 @@ class GameWindow(pyglet.window.Window):
 
         self._ui = UIManager(self)
 
-        print("⚡ Generating spawn area…")
-        for ddx in range(-2, 3):
-            for ddz in range(-2, 3):
+        print("Generating spawn area...")
+        for ddx in range(-3, 4):
+            for ddz in range(-3, 4):
                 self.world.get_or_gen(ddx, ddz)
-        self.ren.rebuild_all(self.world)
-        while self.world.dirty_queue:
-            ch = self.world.dirty_queue.popleft()
-            self.ren.upload(ch, self.world)
-        print(f"✅ {len(self.world.chunks)} chunks, "
-              f"{sum(v[2] for v in self.ren._vaos.values())} verts")
 
-        sx, sz = CHUNK_SIZE // 2, CHUNK_SIZE // 2
+        # === SAFE SPAWN LOGIC ===
+        sx = sz = CHUNK_SIZE // 2
         sy = self.world.surface_y(sx, sz)
-        if sy <= BEDROCK_LEVEL + 1:
-            sy = int(_terrain_height(sx, sz, SEED))
-        self.player = Player(sx + 0.5, float(sy + 3), sz + 0.5)
-        print(f"🧍 Spawn ({sx},{sy+3:.0f},{sz})")
+
+        # Move up until we find solid ground that is NOT water
+        while sy < CHUNK_HEIGHT - 5:
+            bt = self.world.get_block(sx, sy, sz)
+            if bt != 0 and _BT_LIST[bt] != BlockType.WATER:
+                break
+            sy += 1
+
+        # Final safety fallback
+        if sy <= SEA_LEVEL + 3:
+            sy = int(_terrain_height(sx, sz, SEED)) + 5
+
+        # Create player FIRST
+        self.player = Player(sx + 0.5, float(sy + 2), sz + 0.5)
+        
+        # Then attach world reference (needed for respawn)
+        self.player.world = self.world
+
+        print(f"🧍 Safe spawn at ({sx}, {sy+2}, {sz})")
 
         if self.mob_manager:
             spawn_pos = MobVec3(self.player.x, self.player.y, self.player.z)
@@ -2145,7 +2185,8 @@ class GameWindow(pyglet.window.Window):
         self._captured = False
         self._t_prev   = _time.perf_counter()
         self._fps_buf  = deque(maxlen=30)
-        self.set_exclusive_mouse(True);  self._captured = True
+        self.set_exclusive_mouse(True)
+        self._captured = True
         pyglet.clock.schedule_interval(self._tick, 1.0 / 60.0)
 
     def _stream(self):
