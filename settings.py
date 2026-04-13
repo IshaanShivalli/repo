@@ -19,8 +19,8 @@ CHUNK_HEIGHT     = 64
 SEA_LEVEL        = 32
 OCEAN_FLOOR      = 24          # deepest ocean floor level
 BEDROCK_LEVEL    = 1
-VIEW_DISTANCE    = 2
-MESH_PER_FRAME   = 2
+VIEW_DISTANCE    = 1
+MESH_PER_FRAME   = 8
 DAY_TICK_SPEED   = 40.0
 GRAVITY          = 20.0
 JUMP_VEL         = 8.0
@@ -53,8 +53,22 @@ DROWN_DAMAGE_RATE    =  1.0   # HP per second when air is empty
 BUOYANCY_STRENGTH    =  9.0   # upward force when fully submerged (blocks/sÂ²)
 
 # Water flow simulation (block spread)
-WATER_MAX_OPS        = 80     # max flow steps per tick (higher = faster)
-WATER_TICK_INTERVAL  = 0.04   # seconds between flow steps
+WATER_MAX_OPS        = 0      # Disabled for performance
+WATER_TICK_INTERVAL  = 1.0    # seconds between flow steps
+
+# Breaking textures
+BREAKING_TEXTURES = [
+    "textures/assets/minecraft/textures/block/destroy_stage_0.png",
+    "textures/assets/minecraft/textures/block/destroy_stage_1.png",
+    "textures/assets/minecraft/textures/block/destroy_stage_2.png",
+    "textures/assets/minecraft/textures/block/destroy_stage_3.png",
+    "textures/assets/minecraft/textures/block/destroy_stage_4.png",
+    "textures/assets/minecraft/textures/block/destroy_stage_5.png",
+    "textures/assets/minecraft/textures/block/destroy_stage_6.png",
+    "textures/assets/minecraft/textures/block/destroy_stage_7.png",
+    "textures/assets/minecraft/textures/block/destroy_stage_8.png",
+    "textures/assets/minecraft/textures/block/destroy_stage_9.png",
+]
 
 # ═══════════════════════════════════════════════════════════════════════
 #  BLOCK-TYPE REGISTRY  (index == integer stored in chunk arrays)
@@ -85,7 +99,6 @@ _BT_LIST = [
     BlockType.LAPIS_ORE,
     BlockType.WATER,
     BlockType.TORCH,
-    BlockType.BIRCH_LOG,
     BlockType.BIRCH_PLANKS,
     BlockType.SPRUCE_PLANKS,
     BlockType.CACTUS,
@@ -96,6 +109,10 @@ _BT_LIST = [
     BlockType.KELP,
     BlockType.SEAGRASS,
     BlockType.PRISMARINE,
+    # Saplings
+    BlockType.OAK_SAPLING,
+    BlockType.BIRCH_SAPLING,
+    BlockType.SPRUCE_SAPLING,
 ]
 BT: dict = {bt: i for i, bt in enumerate(_BT_LIST)}
 N_BLOCK_TYPES = len(_BT_LIST)
@@ -110,24 +127,42 @@ BT_ROT    = np.zeros((N_BLOCK_TYPES, 6), dtype=np.int8)
 
 for _i, _bt in enumerate(_BT_LIST):
     _props = BLOCK_DATA.get(_bt, {})
-    BT_SOLID[_i]  = 1 if (_props.get("solid", True) and _bt != BlockType.AIR) else 0
-    BT_TRANS[_i]  = 1 if _props.get("transparent", False) else 0
-    BT_LIQUID[_i] = 1 if _bt == BlockType.WATER else 0
-    BT_RENDER[_i] = 1 if (_bt != BlockType.AIR and (BT_SOLID[_i] or BT_TRANS[_i])) else 0
-    BT_CROSS[_i]  = 1 if _props.get("cross", False) else 0
+    
+    # Special handling for kelp and seagrass - they should NOT be solid
+    if _bt in (BlockType.KELP, BlockType.SEAGRASS):
+        BT_SOLID[_i] = 0
+        BT_TRANS[_i] = 1
+        BT_RENDER[_i] = 1
+        BT_LIQUID[_i] = 0
+        BT_CROSS[_i] = 0
+    else:
+        BT_SOLID[_i] = 1 if (_props.get("solid", True) and _bt != BlockType.AIR) else 0
+        BT_TRANS[_i] = 1 if _props.get("transparent", False) else 0
+        BT_LIQUID[_i] = 1 if _bt == BlockType.WATER else 0
+        BT_RENDER[_i] = 1 if (_bt != BlockType.AIR and (BT_SOLID[_i] or BT_TRANS[_i])) else 0
+        BT_CROSS[_i] = 1 if _props.get("cross", False) else 0
+    
     _faces = _props.get("rotate_side_faces")
     if _faces:
         _dir = int(_props.get("rotate_side_dir", 1))
         for _f in _faces:
             if 0 <= _f < 6:
                 BT_ROT[_i, _f] = _dir
+    
     # Fix log texture orientation - logs should have vertical grain on sides
     if _bt in (BlockType.OAK_LOG, BlockType.BIRCH_LOG, BlockType.SPRUCE_LOG):
-        # Face 2,3,4,5 = sides. Rotate UV by -1 (counter-clockwise) or 1 depending on your texture
         BT_ROT[_i, 2] = -1   # front/back
         BT_ROT[_i, 3] = -1   # left/right etc.
         BT_ROT[_i, 4] = -1
         BT_ROT[_i, 5] = -1
+    
+    # Kelp should have no rotation
+    if _bt == BlockType.KELP:
+        BT_ROT[_i, :] = 0
+    
+    # Grass side texture should not rotate
+    if _bt == BlockType.GRASS:
+        BT_ROT[_i, :] = 0
 
 # ── Occlusion mask ───────────────────────────────────────────────────────────
 # Only truly opaque solid blocks should hide their neighbour's faces.
@@ -265,6 +300,15 @@ for _i, _bt in enumerate(_BT_LIST):
     FACE_UV[_i, 4] = _uv_map.get(_side, _uv_map[_white_key])
     FACE_UV[_i, 5] = _uv_map.get(_side, _uv_map[_white_key])
 
+# Force water to use correct texture
+WATER_ID = BT.get(BlockType.WATER, 0)
+if WATER_ID > 0:
+    for key, uv in _uv_map.items():
+        if 'water_still' in key or 'water' in key.lower():
+            for face in range(6):
+                FACE_UV[WATER_ID, face] = uv
+            break
+
 # ═══════════════════════════════════════════════════════════════════════
 #  PER-FACE COLOURS  (N_BLOCK_TYPES × 6 × 4)
 # ═══════════════════════════════════════════════════════════════════════
@@ -274,11 +318,23 @@ _FACE_SHADE = [1.0, 0.55, 0.80, 0.80, 0.90, 0.90]
 def _make_face_colors():
     out = np.ones((N_BLOCK_TYPES, 6, 4), dtype=np.float32)
     for i, bt in enumerate(_BT_LIST):
-        props      = BLOCK_DATA.get(bt, {"color": (1.0, 1.0, 1.0, 1.0)})
-        has_tex    = (props.get("texture") or props.get("texture_top") or
-                      props.get("texture_side") or props.get("texture_bottom"))
-        is_trans   = bool(props.get("transparent", False))
-        tint       = bool(props.get("tint", False))
+        # Special case for water - use solid blue color
+        if bt == BlockType.WATER:
+            for f, shade in enumerate(_FACE_SHADE):
+                out[i, f] = [0.3 * shade, 0.6 * shade, 0.9 * shade, 0.75]
+            continue
+        
+        # Special case for kelp and seagrass
+        if bt in (BlockType.KELP, BlockType.SEAGRASS):
+            for f, shade in enumerate(_FACE_SHADE):
+                out[i, f] = [0.2 * shade, 0.5 * shade, 0.2 * shade, 0.85]
+            continue
+        
+        props = BLOCK_DATA.get(bt, {"color": (1.0, 1.0, 1.0, 1.0)})
+        has_tex = (props.get("texture") or props.get("texture_top") or
+                   props.get("texture_side") or props.get("texture_bottom"))
+        is_trans = bool(props.get("transparent", False))
+        tint = bool(props.get("tint", False))
         tint_faces = props.get("tint_faces")
 
         if has_tex and not is_trans and not tint:
@@ -286,10 +342,14 @@ def _make_face_colors():
         else:
             c = props.get("color", (1.0, 1.0, 1.0, 1.0))
 
-        try:    r, g, b = float(c[0]), float(c[1]), float(c[2])
-        except: r, g, b = 1.0, 1.0, 1.0
+        try:
+            r, g, b = float(c[0]), float(c[1]), float(c[2])
+        except:
+            r, g, b = 1.0, 1.0, 1.0
         if max(r, g, b) > 1.0:
-            r /= 255.0; g /= 255.0; b /= 255.0
+            r /= 255.0
+            g /= 255.0
+            b /= 255.0
 
         if is_trans or tint:
             a = float(c[3]) / 255.0 if len(c) >= 4 else (0.5 if is_trans else 1.0)
@@ -297,8 +357,6 @@ def _make_face_colors():
             a = 1.0
 
         # Cutout blocks (leaves, cactus) have 3-component colors — force a=1.0
-        # so texture alpha channel drives the cutout. Liquid blocks (water) have
-        # a 4-component color with explicit alpha — respect it for transparency.
         if is_trans and has_tex and len(c) < 4:
             a = 1.0
 

@@ -51,6 +51,14 @@ class ItemType:
     PRESSURE_PLATE  = "oak_pressure_plate"
     BUTTON          = "oak_button"
     SLAB            = "oak_slab"
+        # Add to ItemType class:
+    OAK_SAPLING = "oak_sapling"
+    BIRCH_SAPLING = "birch_sapling"
+    SPRUCE_SAPLING = "spruce_sapling"
+
+    # Add to recipes (optional - for crafting):
+    # Sapling can be used as fuel or compost
+
 
     # ── Food ─────────────────────────────────────────────────────────────────
     APPLE           = "apple"

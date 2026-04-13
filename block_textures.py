@@ -41,6 +41,9 @@ class BlockType:
     OAK_LEAVES     = "oak_leaves"
     BIRCH_LEAVES   = "birch_leaves"
     SPRUCE_LEAVES  = "spruce_leaves"
+    OAK_SAPLING    = "oak_sapling"
+    BIRCH_SAPLING  = "birch_sapling"  
+    SPRUCE_SAPLING = "spruce_sapling"
     OAK_PLANKS     = "oak_planks"
     BIRCH_PLANKS   = "birch_planks"
     SPRUCE_PLANKS  = "spruce_planks"
@@ -186,6 +189,32 @@ BLOCK_DATA = {
         "solid":       True, "transparent": True, "drops": None,
     },
 
+    # Add to BLOCK_DATA dict (around line 200):
+    BlockType.OAK_SAPLING: {
+        "color": color.rgb(80, 120, 60),
+        "texture": f"{TEX_BASE}/oak_sapling.png",
+        "solid": False,
+        "transparent": True,
+        "cross": True,
+        "drops": BlockType.OAK_SAPLING,
+    },
+    BlockType.BIRCH_SAPLING: {
+        "color": color.rgb(100, 140, 70),
+        "texture": f"{TEX_BASE}/birch_sapling.png",
+        "solid": False,
+        "transparent": True,
+        "cross": True,
+        "drops": BlockType.BIRCH_SAPLING,
+    },
+    BlockType.SPRUCE_SAPLING: {
+        "color": color.rgb(60, 100, 50),
+        "texture": f"{TEX_BASE}/spruce_sapling.png",
+        "solid": False,
+        "transparent": True,
+        "cross": True,
+        "drops": BlockType.SPRUCE_SAPLING,
+    },
+
     BlockType.OAK_PLANKS: {
         "color":   color.rgb(180, 145, 80),
         "texture": f"{TEX_BASE}/oak_planks.png",
@@ -209,12 +238,14 @@ BLOCK_DATA = {
     BlockType.REDSTONE_ORE: {"color": color.rgb(180,50,50),  "texture": f"{TEX_BASE}/redstone_ore.png", "solid": True, "drops": "redstone"},
     BlockType.LAPIS_ORE:    {"color": color.rgb(60,80,180),  "texture": f"{TEX_BASE}/lapis_ore.png",    "solid": True, "drops": "lapis"},
 
+# In block_textures.py, find the WATER block definition (around line 200) and update:
+
     BlockType.WATER: {
-        "color":          color.rgba(60, 130, 230, 140),   # Slightly more vibrant
-        "texture_top":    f"{TEX_BASE}/water_still.png",
-        "texture_side":   f"{TEX_BASE}/water_still.png",
-        "texture_bottom": f"{TEX_BASE}/water_still.png",
-        "solid":       False, "transparent": True, "drops": None,
+        "color":          color.rgba(60, 130, 230, 180),   # More opaque blue
+        "texture":        f"{TEX_BASE}/water_still.png",   # Use 'texture' not separate faces
+        "solid":          False,
+        "transparent":    True,
+        "drops":          None,
     },
     BlockType.TORCH: {
         "color":       color.rgb(255, 200, 90),

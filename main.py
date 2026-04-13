@@ -41,7 +41,7 @@ from settings import (
     BT_SOLID, BT_TRANS, BT_LIQUID, BT_RENDER, BT_ROT,
     BT_OCCLUDE,          # ← the fixed occlusion mask (solid AND opaque)
     BT_CROSS,
-    FACE_UV, FACE_COLORS,
+    FACE_UV, FACE_COLORS, BREAKING_TEXTURES,
     _atlas_img, _uv_map, _white_key,
     _persp, _lookat, _load_image_rgba,
 )
@@ -89,32 +89,15 @@ in vec3 in_normal;
 in vec4 in_color;
 in vec2 in_uv;
 uniform mat4 u_mvp;
-uniform float u_time;
 out vec4 v_color;
 out vec3 v_normal;
 out vec2 v_uv;
-out float v_is_water;
 
 void main() {
     gl_Position = u_mvp * vec4(in_pos, 1.0);
-    v_color  = in_color;
+    v_color = in_color;
     v_normal = in_normal;
-    
-    v_is_water = step(0.5, v_color.b - max(v_color.r, v_color.g) + 0.5);
-    
-    float flow_speed = 0.04;   // very slow and calm
-    
-    vec2 offset = vec2(0.0);
-    if (v_is_water > 0.5) {
-        if (abs(in_normal.y) > 0.9) {
-            // Top surface: extremely gentle movement (almost still)
-            offset = vec2(u_time * flow_speed * 0.3, u_time * flow_speed * 0.5);
-        } else {
-            // Side faces: slow downward flow only
-            offset = vec2(0.0, u_time * flow_speed * 0.8);
-        }
-    }
-    v_uv = in_uv + offset;
+    v_uv = in_uv;
 }
 """
 
@@ -123,7 +106,6 @@ WATER_FRAG = """
 in vec4 v_color;
 in vec3 v_normal;
 in vec2 v_uv;
-in float v_is_water;
 uniform vec3 u_sun;
 uniform float u_ambient;
 uniform vec3 u_tint;
@@ -138,13 +120,11 @@ void main() {
     float light = u_ambient + (1.0 - u_ambient) * diff;
     
     vec3 rgb = texel.rgb * v_color.rgb;
-    
-    // Softer water look with better transparency
-    float alpha = v_color.a * texel.a * 0.78;
-    
-    frag_color = vec4(rgb * u_tint * light, alpha);
+    frag_color = vec4(rgb * u_tint * light, v_color.a * texel.a);
 }
 """
+
+
 SKY_VERT = """
 #version 330 core
 in vec2 in_pos; out float v_y; out vec2 v_pos;
@@ -223,16 +203,279 @@ class World:
         self.chunks: dict[tuple, Chunk] = {}
         self.dirty_queue: deque[Chunk]  = deque()
         self.time_of_day = 0.0
+        
+        # Tree tracking for leaf decay
+        self.tree_wood_positions = {}  # {position: tree_id}
+        self.tree_leaves_positions = {}  # {tree_id: set(positions)}
+        self.decaying_leaves = {}  # {position: decay_timer}
+        self.next_tree_id = 0
+        
+        # Block breaking animation
+        self.breaking_blocks = {}  # {position: (progress, texture_index, break_time)}
 
     @staticmethod
     def world_to_chunk(wx, wz):
         return (int(math.floor(wx / CHUNK_SIZE)), int(math.floor(wz / CHUNK_SIZE)))
+
+    def start_breaking_block(self, wx, wy, wz):
+        """Start breaking animation for a block."""
+        pos = (wx, wy, wz)
+        if pos not in self.breaking_blocks:
+            self.breaking_blocks[pos] = {
+                'progress': 0.0,
+                'texture': 0,
+                'start_time': _time.time()
+            }
+
+    def update_breaking_block(self, wx, wy, wz, dt):
+        """Update block breaking progress - 0.75 seconds like Minecraft."""
+        pos = (wx, wy, wz)
+        if pos in self.breaking_blocks:
+            self.breaking_blocks[pos]['progress'] += dt
+            # Calculate texture stage (0-9) over 0.75 seconds
+            stage = int(self.breaking_blocks[pos]['progress'] * 13.33)  # 10 stages / 0.75s = 13.33
+            stage = min(9, stage)
+            self.breaking_blocks[pos]['texture'] = stage
+            
+            # If progress reaches 0.75 seconds, block is broken
+            if self.breaking_blocks[pos]['progress'] >= 0.75:
+                return True
+        return False
+
+    def cancel_breaking_block(self, wx, wy, wz):
+        """Cancel block breaking animation."""
+        pos = (wx, wy, wz)
+        if pos in self.breaking_blocks:
+            del self.breaking_blocks[pos]
+
+    def get_breaking_texture(self, wx, wy, wz):
+        """Get the current breaking texture stage for a block."""
+        pos = (wx, wy, wz)
+        if pos in self.breaking_blocks:
+            stage = self.breaking_blocks[pos]['texture']
+            return BREAKING_TEXTURES[stage]
+        return None
+
+    def remove_breaking_block(self, wx, wy, wz):
+        """Remove block from breaking animation after being broken."""
+        pos = (wx, wy, wz)
+        if pos in self.breaking_blocks:
+            del self.breaking_blocks[pos]
 
     @staticmethod
     def local(wx, wz):
         cx = int(math.floor(wx / CHUNK_SIZE))
         cz = int(math.floor(wz / CHUNK_SIZE))
         return cx, cz, wx - cx * CHUNK_SIZE, wz - cz * CHUNK_SIZE
+
+    def register_tree(self, wood_positions, leaves_positions):
+        """Register a new tree with its wood and leaves positions."""
+        tree_id = self.next_tree_id
+        self.next_tree_id += 1
+        
+        for pos in wood_positions:
+            self.tree_wood_positions[pos] = tree_id
+        
+        self.tree_leaves_positions[tree_id] = set(leaves_positions)
+        return tree_id
+
+    def remove_wood_block(self, wx, wy, wz):
+        """Called when a wood block is broken. Triggers leaf decay if last wood."""
+        pos = (wx, wy, wz)
+        
+        if pos in self.tree_wood_positions:
+            tree_id = self.tree_wood_positions[pos]
+            
+            # Remove this wood block from tracking
+            if pos in self.tree_wood_positions:
+                del self.tree_wood_positions[pos]
+            
+            # Check if this was the last wood block
+            remaining_wood = [p for p, tid in self.tree_wood_positions.items() if tid == tree_id]
+            
+            if len(remaining_wood) == 0:
+                # Last wood block broken - start decaying all leaves
+                leaves = self.tree_leaves_positions.get(tree_id, set())
+                for leaf_pos in leaves:
+                    # Check if leaf still exists before decaying
+                    lx, ly, lz = leaf_pos
+                    bt = self.get_block(lx, ly, lz)
+                    if bt and bt < N_BLOCK_TYPES:
+                        bname = _BT_LIST[bt]
+                        if bname in (BlockType.OAK_LEAVES, BlockType.BIRCH_LEAVES, BlockType.SPRUCE_LEAVES):
+                            self.start_leaf_decay(lx, ly, lz)
+                
+                # Clean up tracking
+                if tree_id in self.tree_leaves_positions:
+                    del self.tree_leaves_positions[tree_id]    
+    
+    def start_leaf_decay(self, wx, wy, wz):
+        """Start the decay timer for a leaf block - Minecraft-like timing."""
+        pos = (wx, wy, wz)
+        if pos not in self.decaying_leaves:
+            # Minecraft leaf decay takes 1-2 seconds, but random per leaf
+            import random
+            # Random decay time between 1.0 and 2.5 seconds (like Minecraft)
+            decay_time = random.uniform(2.5, 10.0)
+            self.decaying_leaves[pos] = decay_time
+
+    def update_leaf_decay(self, dt):
+        """Update decaying leaves and remove them when timer expires."""
+        to_remove = []
+        
+        # First collect positions that have finished decaying
+        for pos, timer in list(self.decaying_leaves.items()):
+            timer -= dt
+            if timer <= 0:
+                to_remove.append(pos)
+            else:
+                self.decaying_leaves[pos] = timer
+        
+        # Process each decayed leaf
+        for wx, wy, wz in to_remove:
+            # Check if block is still a leaf
+            bt = self.get_block(wx, wy, wz)
+            if bt and bt < N_BLOCK_TYPES:
+                bname = _BT_LIST[bt]  # MOVED THIS LINE OUTSIDE THE IF
+                if bname in (BlockType.OAK_LEAVES, BlockType.BIRCH_LEAVES, BlockType.SPRUCE_LEAVES):
+                    # Get drops before removing
+                    drops = self.get_leaf_drops(bname)
+                    
+                    # Store drops in a queue to be picked up by player
+                    if not hasattr(self, 'pending_drops'):
+                        self.pending_drops = []
+                    
+                    for item, count in drops:
+                        self.pending_drops.append((wx, wy, wz, item, count))
+                        print(f"Leaf drop: {item} x{count} at ({wx},{wy},{wz})")
+                    
+                    # Remove the leaf block
+                    self.set_block(wx, wy, wz, 0)
+            
+            # Safely remove from dictionary
+            if (wx, wy, wz) in self.decaying_leaves:
+                del self.decaying_leaves[(wx, wy, wz)]
+
+    def collect_nearby_drops(self, player_x, player_y, player_z, radius=2.5):
+        """Collect drops that are near the player."""
+        if not hasattr(self, 'pending_drops'):
+            return []
+        
+        collected = []
+        remaining_drops = []
+        
+        for wx, wy, wz, item, count in self.pending_drops:
+            # Calculate distance to player
+            dx = wx + 0.5 - player_x
+            dy = wy + 0.5 - player_y
+            dz = wz + 0.5 - player_z
+            dist = math.sqrt(dx*dx + dy*dy + dz*dz)
+            
+            if dist < radius:
+                collected.append((item, count))
+                print(f"Collected {item} x{count}")
+            else:
+                remaining_drops.append((wx, wy, wz, item, count))
+        
+        self.pending_drops = remaining_drops
+        return collected
+
+    def get_leaf_drops(self, leaf_type):
+        """Return drops for a leaf block based on tree type - Minecraft rates."""
+        import random
+        
+        # Base chance for any drop: ~5% for sapling, ~2% for apple (oak only)
+        # Most leaves drop nothing
+        
+        if leaf_type == BlockType.OAK_LEAVES:
+            # Oak: 5% sapling, 0.5% apple (Minecraft-like rates)
+            r = random.randint(1, 1000)
+            if r <= 5:  # 0.5% chance for apple
+                return [(ItemType.APPLE, 1)]
+            elif r <= 55:  # 5% chance for sapling (50 + 5)
+                return [(BlockType.OAK_SAPLING, 1)]
+            elif r <= 65:  # 1% chance for stick (rare)
+                return [(ItemType.STICK, 1)]
+            # 94.5% chance of nothing
+        
+        elif leaf_type == BlockType.BIRCH_LEAVES:
+            # Birch: 5% sapling
+            if random.randint(1, 100) <= 5:
+                return [(BlockType.BIRCH_SAPLING, 1)]
+            # 95% chance of nothing
+        
+        elif leaf_type == BlockType.SPRUCE_LEAVES:
+            # Spruce: 5% sapling
+            if random.randint(1, 100) <= 5:
+                return [(BlockType.SPRUCE_SAPLING, 1)]
+            # 95% chance of nothing
+        
+        return []  # Most leaves drop nothing
+
+    def scan_chunk_for_trees(self, cx, cz, blocks):
+        """Scan a chunk for trees and register them."""
+        S = CHUNK_SIZE
+        H = CHUNK_HEIGHT
+        
+        # Find all wood blocks
+        wood_positions = []
+        for x in range(S):
+            for z in range(S):
+                for y in range(H):
+                    bt = blocks[x, y, z]
+                    if bt > 0 and bt < N_BLOCK_TYPES:
+                        bname = _BT_LIST[bt]
+                        if bname in (BlockType.OAK_LOG, BlockType.BIRCH_LOG, BlockType.SPRUCE_LOG):
+                            wood_positions.append((x, y, z))
+        
+        # Group wood blocks into trees (connected components)
+        visited = set()
+        for wx, wy, wz in wood_positions:
+            if (wx, wy, wz) in visited:
+                continue
+            
+            # BFS to find connected wood blocks (tree trunk)
+            tree_wood = []
+            queue = [(wx, wy, wz)]
+            visited.add((wx, wy, wz))
+            
+            while queue:
+                x, y, z = queue.pop(0)
+                tree_wood.append((x, y, z))
+                
+                # Check neighbors
+                for dx, dy, dz in [(1,0,0), (-1,0,0), (0,1,0), (0,-1,0), (0,0,1), (0,0,-1)]:
+                    nx, ny, nz = x + dx, y + dy, z + dz
+                    if 0 <= nx < S and 0 <= ny < H and 0 <= nz < S:
+                        if (nx, ny, nz) not in visited:
+                            nbt = blocks[nx, ny, nz]
+                            if nbt > 0 and nbt < N_BLOCK_TYPES:
+                                nname = _BT_LIST[nbt]
+                                if nname in (BlockType.OAK_LOG, BlockType.BIRCH_LOG, BlockType.SPRUCE_LOG):
+                                    visited.add((nx, ny, nz))
+                                    queue.append((nx, ny, nz))
+            
+            # Find leaves connected to this tree (within 5 blocks of any wood)
+            tree_leaves = set()
+            leaf_types = (BlockType.OAK_LEAVES, BlockType.BIRCH_LEAVES, BlockType.SPRUCE_LEAVES)
+            
+            for wx2, wy2, wz2 in tree_wood:
+                for dx in range(-5, 6):
+                    for dy in range(-5, 6):
+                        for dz in range(-5, 6):
+                            nx, ny, nz = wx2 + dx, wy2 + dy, wz2 + dz
+                            if 0 <= nx < S and 0 <= ny < H and 0 <= nz < S:
+                                nbt = blocks[nx, ny, nz]
+                                if nbt > 0 and nbt < N_BLOCK_TYPES:
+                                    nname = _BT_LIST[nbt]
+                                    if nname in leaf_types:
+                                        tree_leaves.add((nx, ny, nz))
+            
+            if tree_wood and tree_leaves:
+                # Convert to world coordinates
+                world_wood = [(cx * S + x, y, cz * S + z) for x, y, z in tree_wood]
+                world_leaves = [(cx * S + x, y, cz * S + z) for x, y, z in tree_leaves]
+                self.register_tree(world_wood, world_leaves)
 
     def get_or_gen(self, cx, cz):
         k = (cx, cz)
@@ -246,11 +489,13 @@ class World:
                 BT[BlockType.CACTUS],
                 BT[BlockType.COAL_ORE],    BT[BlockType.IRON_ORE],
                 BT[BlockType.GOLD_ORE],    BT[BlockType.DIAMOND_ORE],
-                # Ocean biome blocks
                 BT[BlockType.SAND_OCEAN],  BT[BlockType.KELP],
                 BT[BlockType.SEAGRASS],
-                # Birch forest biome
                 BT[BlockType.BIRCH_LOG],   BT[BlockType.BIRCH_LEAVES])
+            
+            # Register trees in this chunk
+            self.scan_chunk_for_trees(cx, cz, blk)
+            
             ch = Chunk(cx, cz, blk)
             self.chunks[k] = ch
             self.dirty_queue.append(ch)
@@ -283,6 +528,15 @@ class World:
         ch = self.chunks.get((cx, cz))
         if ch is None: return
         if not (0 <= lx < CHUNK_SIZE and 0 <= wy < CHUNK_HEIGHT and 0 <= lz < CHUNK_SIZE): return
+        
+        old_bt = ch.blocks[lx, wy, lz]
+        
+        # Check if we're removing a wood block
+        if old_bt > 0 and bt == 0 and old_bt < N_BLOCK_TYPES:
+            old_name = _BT_LIST[old_bt]
+            if old_name in (BlockType.OAK_LOG, BlockType.BIRCH_LOG, BlockType.SPRUCE_LOG):
+                self.remove_wood_block(wx, wy, wz)
+        
         ch.blocks[lx, wy, lz] = bt
         ch.dirty = True
         if ch not in self.dirty_queue:
@@ -325,10 +579,6 @@ class World:
         return True
 
     # ── water flow simulation ─────────────────────────────────────────────────
-    # We keep a pending set of (wx,wy,wz) blocks that need to be checked for
-    # flow. When a block is placed / removed we schedule its neighbours.
-    # Each tick we process a bounded batch so it never stalls the frame.
-
     def _init_water(self):
         if not hasattr(self, '_water_queue'):
             self._water_queue: deque = deque()
@@ -344,48 +594,56 @@ class World:
                 self._water_queue.append(pos)
 
     def _water_tick(self, max_ops: int = WATER_MAX_OPS):
-        """Process up to max_ops water-flow steps."""
+        """Process water flow - optimized version."""
         self._init_water()
         ID_WATER = BT.get(BlockType.WATER, 0)
-        if not ID_WATER:
+        if not ID_WATER or max_ops == 0:
             return
+        
         ops = 0
         while self._water_queue and ops < max_ops:
-            pos = self._water_queue.popleft()
-            self._water_scheduled.discard(pos)
-            ops += 1
-            wx, wy, wz = pos
-            bt = self.get_block(wx, wy, wz)
-
-            # Only flow from a source water block
-            if bt != ID_WATER:
-                continue
-
-            # Flow downward first
-            below_bt = self.get_block(wx, wy - 1, wz)
-            if below_bt == 0:  # air below → fall straight down
-                self.set_block(wx, wy - 1, wz, ID_WATER)
-                self.schedule_water(wx, wy - 1, wz)
-                continue  # downward flow takes priority – skip horizontal
-
-            # Spread horizontally into open cells (even if they drop after)
-            for nx, nz in ((wx-1,wz),(wx+1,wz),(wx,wz-1),(wx,wz+1)):
-                nb_bt = self.get_block(nx, wy, nz)
-                if nb_bt == 0:
-                    # Allow flow even if below is empty; it will fall next ticks.
-                    self.set_block(nx, wy, nz, ID_WATER)
-                    self.schedule_water(nx, wy, nz)
+            try:
+                pos = self._water_queue.popleft()
+                self._water_scheduled.discard(pos)
+                ops += 1
+                
+                wx, wy, wz = pos
+                bt = self.get_block(wx, wy, wz)
+                
+                if bt != ID_WATER:
+                    continue
+                
+                below_bt = self.get_block(wx, wy - 1, wz)
+                if below_bt == 0:
+                    self.set_block(wx, wy - 1, wz, ID_WATER)
+                    continue
+                
+                directions = [(wx-1, wz), (wx+1, wz), (wx, wz-1), (wx, wz+1)]
+                import random
+                for _ in range(min(2, len(directions))):
+                    idx = random.randint(0, len(directions) - 1)
+                    nx, nz = directions.pop(idx)
+                    nb_bt = self.get_block(nx, wy, nz)
+                    if nb_bt == 0:
+                        self.set_block(nx, wy, nz, ID_WATER)
+            except IndexError:
+                break
 
     def tick(self, dt):
         self.time_of_day = (self.time_of_day + DAY_TICK_SPEED * dt) % 24000.0
-        # Run water simulation at a fixed, slower cadence
+        
+        # Update leaf decay
+        self.update_leaf_decay(dt)
+        
+        # OPTIMIZED WATER FLOW
         if not hasattr(self, "_water_accum"):
             self._water_accum = 0.0
+        
         self._water_accum += dt
-        while self._water_accum >= WATER_TICK_INTERVAL:
-            self._water_tick(WATER_MAX_OPS)
+        
+        if self._water_accum >= WATER_TICK_INTERVAL:
+            self._water_tick(min(WATER_MAX_OPS, 10))
             self._water_accum -= WATER_TICK_INTERVAL
-
     def sky(self):
         t = self.time_of_day
         def L(a,b,f): return (a[0]+(b[0]-a[0])*f, a[1]+(b[1]-a[1])*f, a[2]+(b[2]-a[2])*f)
@@ -413,7 +671,9 @@ class World:
         elif t <= 22000:          return "🌙 Night"
         else:                     return "🌄 Sunrise"
 
-
+# ═══════════════════════════════════════════════════════════════════════
+#  RENDERER
+# ═══════════════════════════════════════════════════════════════════════
 # ═══════════════════════════════════════════════════════════════════════
 #  RENDERER
 # ═══════════════════════════════════════════════════════════════════════
@@ -471,11 +731,130 @@ class Renderer:
         ctx.enable(moderngl.DEPTH_TEST)
         ctx.enable(moderngl.BLEND)
         ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
-        if SHOW_ALL_FACES: ctx.disable(moderngl.CULL_FACE)
-        else:              ctx.enable(moderngl.CULL_FACE)
+        if SHOW_ALL_FACES:
+            ctx.disable(moderngl.CULL_FACE)
+        else:
+            ctx.enable(moderngl.CULL_FACE)
         ctx.front_face = 'ccw'
         self._vaos: dict = {}
 
+    def draw_breaking_overlay(self, world, player, mvp):
+        """Draw block breaking overlay ONLY on the face being mined."""
+        if not hasattr(world, 'breaking_blocks') or not world.breaking_blocks:
+            return
+        
+        rc = player.raycast(world)
+        if rc is None:
+            return
+        
+        hit, norm, prev = rc
+        hx, hy, hz = hit
+        pos = (hx, hy, hz)
+        
+        if pos not in world.breaking_blocks:
+            return
+        
+        data = world.breaking_blocks[pos]
+        stage = data['texture']
+        
+        if stage >= 10:
+            return
+        
+        # Load crack textures if not already loaded
+        if not hasattr(self, 'crack_textures'):
+            self.crack_textures = []
+            for tex_path in BREAKING_TEXTURES:
+                img = _load_image_rgba(_resolve_path(tex_path))
+                if img:
+                    tex = self.ctx.texture(img.size, 4, img.tobytes())
+                    tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+                    self.crack_textures.append(tex)
+            
+            crack_vert = """
+            #version 330 core
+            in vec3 in_pos;
+            in vec2 in_uv;
+            uniform mat4 u_mvp;
+            out vec2 v_uv;
+            void main() {
+                gl_Position = u_mvp * vec4(in_pos, 1.0);
+                v_uv = in_uv;
+            }
+            """
+            crack_frag = """
+            #version 330 core
+            in vec2 v_uv;
+            uniform sampler2D u_tex;
+            out vec4 frag_color;
+            void main() {
+                vec4 texel = texture(u_tex, v_uv);
+                if (texel.a < 0.05) discard;
+                frag_color = texel;
+            }
+            """
+            self.crack_prog = self.ctx.program(vertex_shader=crack_vert, fragment_shader=crack_frag)
+        
+        if not self.crack_textures or stage >= len(self.crack_textures):
+            return
+        
+        tex = self.crack_textures[stage]
+        x, y, z = hx, hy, hz
+        
+        # Get which face was hit from the raycast normal
+        nx, ny, nz = norm
+        
+        # Create vertices for ONLY the face that was hit
+        vertices = []
+        
+        if abs(nx) > 0.5:  # Hit X face (left or right)
+            face_x = x + (1 if nx > 0 else 0)
+            vertices = [
+                face_x, y, z, 0, 0,
+                face_x, y, z+1, 0, 1,
+                face_x, y+1, z+1, 1, 1,
+                face_x, y, z, 0, 0,
+                face_x, y+1, z+1, 1, 1,
+                face_x, y+1, z, 1, 0,
+            ]
+        elif abs(ny) > 0.5:  # Hit Y face (top or bottom)
+            face_y = y + (1 if ny > 0 else 0)
+            vertices = [
+                x, face_y, z, 0, 0,
+                x+1, face_y, z, 1, 0,
+                x+1, face_y, z+1, 1, 1,
+                x, face_y, z, 0, 0,
+                x+1, face_y, z+1, 1, 1,
+                x, face_y, z+1, 0, 1,
+            ]
+        else:  # Hit Z face (front or back)
+            face_z = z + (1 if nz > 0 else 0)
+            vertices = [
+                x, y, face_z, 0, 0,
+                x+1, y, face_z, 1, 0,
+                x+1, y+1, face_z, 1, 1,
+                x, y, face_z, 0, 0,
+                x+1, y+1, face_z, 1, 1,
+                x, y+1, face_z, 0, 1,
+            ]
+        
+        vertices_np = np.array(vertices, dtype=np.float32)
+        vbo = self.ctx.buffer(vertices_np.tobytes())
+        vao = self.ctx.vertex_array(self.crack_prog, [(vbo, '3f 2f', 'in_pos', 'in_uv')])
+        
+        self.ctx.disable(moderngl.DEPTH_TEST)
+        self.ctx.enable(moderngl.BLEND)
+        self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+        
+        self.crack_prog['u_mvp'].write(mvp.T.astype(np.float32).tobytes())
+        tex.use(0)
+        self.crack_prog['u_tex'].value = 0
+        vao.render(moderngl.TRIANGLES)
+        
+        vbo.release()
+        vao.release()
+        
+        self.ctx.enable(moderngl.DEPTH_TEST)
+        self.ctx.disable(moderngl.BLEND)
     def upload(self, ch: Chunk, world: World) -> None:
         k = (ch.cx, ch.cz)
         if k in self._vaos:
@@ -496,12 +875,6 @@ class Renderer:
         front = world.chunks.get((ch.cx, ch.cz+1));  front and nb_z_pos.__setitem__(slice(None), front.blocks[:,:,0])
 
         # ── KEY FIX: pass BT_OCCLUDE (not BT_SOLID) as the occlusion mask ────
-        # BT_SOLID includes leaves and cactus (solid=True, transparent=True).
-        # Using BT_SOLID caused adjacent leaf/cactus faces to be culled away,
-        # making the blocks appear hollow or completely invisible.
-        # BT_OCCLUDE = solid AND NOT transparent, so only truly opaque blocks
-        # hide their neighbours' faces.
-        # Two-pass render: split opaque and transparent into separate VAOs
         vdata_o, vdata_t = build_mesh_split(
             ch.blocks, nb_x_neg, nb_x_pos, nb_z_neg, nb_z_pos,
             BT_RENDER, BT_OCCLUDE, BT_TRANS, BT_LIQUID, BT_CROSS, BT_ROT, FACE_COLORS, FACE_UV,
@@ -509,7 +882,8 @@ class Renderer:
             1 if USE_GREEDY_MESH else 0,
         )
         if vdata_o.size == 0 and vdata_t.size == 0:
-            ch.dirty = False;  return
+            ch.dirty = False
+            return
 
         vbo_o = self.ctx.buffer(vdata_o.tobytes() if vdata_o.size > 0 else bytes(12))
         vao_o = self.ctx.vertex_array(
@@ -533,15 +907,20 @@ class Renderer:
     def remove(self, k):
         if k in self._vaos:
             entry = self._vaos[k]
-            entry[0].release(); entry[1].release()
-            if len(entry) > 3: entry[3].release(); entry[4].release()
+            entry[0].release()
+            entry[1].release()
+            if len(entry) > 3:
+                entry[3].release()
+                entry[4].release()
             del self._vaos[k]
 
     def rebuild_all(self, world: World) -> None:
-        for k in list(self._vaos): self.remove(k)
+        for k in list(self._vaos):
+            self.remove(k)
         world.dirty_queue.clear()
         for ch in world.chunks.values():
-            ch.dirty = True;  world.dirty_queue.append(ch)
+            ch.dirty = True
+            world.dirty_queue.append(ch)
 
     def draw(self, player: Player, world: World, w: int, h: int) -> None:
         top, bot, sun, amb, moon_dir, moon_tex = world.sky()
@@ -549,69 +928,93 @@ class Renderer:
 
         # Sky
         self.ctx.disable(moderngl.DEPTH_TEST)
-        self.skyp['u_top'].value = top;  self.skyp['u_bot'].value = bot
+        self.skyp['u_top'].value = top
+        self.skyp['u_bot'].value = bot
         self.sky_vao.render(moderngl.TRIANGLE_STRIP)
         self.ctx.enable(moderngl.DEPTH_TEST)
 
         # Sun / Moon billboards
         if self.sun_tex:
             fx, fy, fz = player.forward()
-            fl = math.sqrt(fx*fx+fy*fy+fz*fz);  fx/=fl; fy/=fl; fz/=fl
-            rx,ry,rz = fy*0-fz*1, fz*0-fx*0, fx*1-fy*0
-            rl = math.sqrt(rx*rx+ry*ry+rz*rz)
-            if rl < 1e-6: rx,ry,rz = 1.,0.,0.
-            else:         rx/=rl; ry/=rl; rz/=rl
-            ux,uy,uz = ry*fz-rz*fy, rz*fx-rx*fz, rx*fy-ry*fx
+            fl = math.sqrt(fx*fx+fy*fy+fz*fz)
+            fx /= fl
+            fy /= fl
+            fz /= fl
+            rx, ry, rz = fy*0 - fz*1, fz*0 - fx*0, fx*1 - fy*0
+            rl = math.sqrt(rx*rx + ry*ry + rz*rz)
+            if rl < 1e-6:
+                rx, ry, rz = 1.0, 0.0, 0.0
+            else:
+                rx /= rl
+                ry /= rl
+                rz /= rl
+            ux, uy, uz = ry*fz - rz*fy, rz*fx - rx*fz, rx*fy - ry*fx
 
-            proj = _persp(FOV, w/h, 0.05, 800.)
+            proj = _persp(FOV, w/h, 0.05, 800.0)
             view = player.view_mat()
-            mvp  = proj @ view
+            mvp = proj @ view
             self.sunp['u_mvp'].write(mvp.T.astype(np.float32).tobytes())
 
             def write_bb(vbo, center, size):
-                cx2,cy2,cz2 = center
-                sx2=rx*size; sy2=ry*size; sz2=rz*size
-                ux2=ux*size; uy2=uy*size; uz2=uz*size
-                p0=(cx2-sx2-ux2,cy2-sy2-uy2,cz2-sz2-uz2)
-                p1=(cx2+sx2-ux2,cy2+sy2-uy2,cz2+sz2-uz2)
-                p2=(cx2+sx2+ux2,cy2+sy2+uy2,cz2+sz2+uz2)
-                p3=(cx2-sx2+ux2,cy2-sy2+uy2,cz2-sz2+uz2)
-                data = np.array([*p0,0.,1.,*p1,1.,1.,*p2,1.,0.,
-                                  *p0,0.,1.,*p2,1.,0.,*p3,0.,0.], dtype=np.float32)
+                cx2, cy2, cz2 = center
+                sx2 = rx * size
+                sy2 = ry * size
+                sz2 = rz * size
+                ux2 = ux * size
+                uy2 = uy * size
+                uz2 = uz * size
+                p0 = (cx2 - sx2 - ux2, cy2 - sy2 - uy2, cz2 - sz2 - uz2)
+                p1 = (cx2 + sx2 - ux2, cy2 + sy2 - uy2, cz2 + sz2 - uz2)
+                p2 = (cx2 + sx2 + ux2, cy2 + sy2 + uy2, cz2 + sz2 + uz2)
+                p3 = (cx2 - sx2 + ux2, cy2 - sy2 + uy2, cz2 - sz2 + uz2)
+                data = np.array([
+                    *p0, 0.0, 1.0,
+                    *p1, 1.0, 1.0,
+                    *p2, 1.0, 0.0,
+                    *p0, 0.0, 1.0,
+                    *p2, 1.0, 0.0,
+                    *p3, 0.0, 0.0
+                ], dtype=np.float32)
                 vbo.write(data.tobytes())
 
-            dist = 200.
-            sx2,sy2,sz2 = sun
+            dist = 200.0
+            sx2, sy2, sz2 = sun
             write_bb(self.sun_vbo,
-                     (player.x+sx2*dist, player.y+sy2*dist, player.z+sz2*dist), 12.)
-            self.sun_tex.use(0);  self.sunp['u_tex'].value = 0
+                     (player.x + sx2 * dist, player.y + sy2 * dist, player.z + sz2 * dist), 12.0)
+            self.sun_tex.use(0)
+            self.sunp['u_tex'].value = 0
             self.sun_vao2.render(moderngl.TRIANGLES)
 
             mtex = self.moon_texes.get(moon_tex)
             if mtex:
-                mx2,my2,mz2 = moon_dir
+                mx2, my2, mz2 = moon_dir
                 write_bb(self.moon_vbo,
-                         (player.x+mx2*dist, player.y+my2*dist, player.z+mz2*dist), 10.)
-                mtex.use(0);  self.sunp['u_tex'].value = 0
+                         (player.x + mx2 * dist, player.y + my2 * dist, player.z + mz2 * dist), 10.0)
+                mtex.use(0)
+                self.sunp['u_tex'].value = 0
                 self.moon_vao.render(moderngl.TRIANGLES)
 
         # Clouds
         self.cloud_time += 0.016
         ex, ey, ez = player.eye()
-        proj_c = _persp(FOV, w/h, 0.05, 2000.)
+        proj_c = _persp(FOV, w/h, 0.05, 2000.0)
         view_c = player.view_mat()
-        mvp_c  = proj_c @ view_c
-        import ctypes
+        mvp_c = proj_c @ view_c
         self.cloudp["u_mvp"].write(mvp_c.T.astype(np.float32).tobytes())
         self.cloudp["u_time"].value = self.cloud_time
         sky_col = list(bot)
         self.cloudp["u_sky_col"].value = tuple(sky_col)
+        
         # Offset cloud plane to follow player XZ
         CLOUD_Y = float(SEA_LEVEL + 80)
         CLOUD_R = 400.0
-        cx2,cz2 = ex, ez
-        cq = np.array([cx2-CLOUD_R,CLOUD_Y,cz2-CLOUD_R, cx2+CLOUD_R,CLOUD_Y,cz2-CLOUD_R,
-                        cx2+CLOUD_R,CLOUD_Y,cz2+CLOUD_R, cx2-CLOUD_R,CLOUD_Y,cz2+CLOUD_R], dtype=np.float32)
+        cx2, cz2 = ex, ez
+        cq = np.array([
+            cx2 - CLOUD_R, CLOUD_Y, cz2 - CLOUD_R,
+            cx2 + CLOUD_R, CLOUD_Y, cz2 - CLOUD_R,
+            cx2 + CLOUD_R, CLOUD_Y, cz2 + CLOUD_R,
+            cx2 - CLOUD_R, CLOUD_Y, cz2 + CLOUD_R
+        ], dtype=np.float32)
         self.cloud_vbo.write(cq.tobytes())
         self.ctx.enable(moderngl.BLEND)
         self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
@@ -620,16 +1023,23 @@ class Renderer:
         self.ctx.disable(moderngl.BLEND)
 
         # World chunks
-        if SHOW_ALL_FACES: self.ctx.disable(moderngl.CULL_FACE)
-        else:              self.ctx.enable(moderngl.CULL_FACE)
-        proj = _persp(FOV, w/h, 0.05, 800.)
+        if SHOW_ALL_FACES:
+            self.ctx.disable(moderngl.CULL_FACE)
+        else:
+            self.ctx.enable(moderngl.CULL_FACE)
+        
+        proj = _persp(FOV, w/h, 0.05, 800.0)
         view = player.view_mat()
-        mvp  = proj @ view
+        mvp = proj @ view
+        self.draw_breaking_overlay(world, player, mvp)  
+        # Debug: Check if breaking is happening
+        if hasattr(self, 'current_breaking_block') and self.current_breaking_block:
+            print(f"Breaking block at {self.current_breaking_block}")  # This will print in console
         self.prog['u_mvp'].write(mvp.T.astype(np.float32).tobytes())
-        self.prog['u_sun'].value     = sun
+        self.prog['u_sun'].value = sun
         self.prog['u_ambient'].value = amb
 
-        # Underwater tint: if player eye is inside a water block, tint blue-green
+        # Underwater tint
         eye_bt = world.get_block(int(math.floor(player.x)),
                                   int(math.floor(player.y + EYE_OFFSET - 0.1)),
                                   int(math.floor(player.z)))
@@ -639,34 +1049,36 @@ class Renderer:
         else:
             self.prog['u_tint'].value = (1.0, 1.0, 1.0)
 
-        self.atlas.use(0);  self.prog['u_tex'].value = 0
-        # Pass 1: Opaque geometry – depth write ON
+        self.atlas.use(0)
+        self.prog['u_tex'].value = 0
+        
+        # Pass 1: Opaque geometry
         self.ctx.depth_func = '<'
         for k2, entry in self._vaos.items():
             nv = entry[2]
-            if nv > 0: entry[0].render(moderngl.TRIANGLES, vertices=nv)
+            if nv > 0:
+                entry[0].render(moderngl.TRIANGLES, vertices=nv)
+        
         # Pass 2: Transparent geometry (water, leaves)
-        # depth_mask=False: water doesn't write depth so layers blend through each other.
-        # Back-to-front sort ensures correct painter's algorithm blending.
         self.ctx.enable(moderngl.BLEND)
         self.ctx.depth_mask = False
         px, pz = player.x, player.z
         trans_chunks = [(k2, e) for k2, e in self._vaos.items()
                         if len(e) > 3 and e[5] > 0]
         trans_chunks.sort(
-            key=lambda t: -(t[0][0]*CHUNK_SIZE - px)**2 - (t[0][1]*CHUNK_SIZE - pz)**2
+            key=lambda t: -(t[0][0] * CHUNK_SIZE - px)**2 - (t[0][1] * CHUNK_SIZE - pz)**2
         )
-        # Set water shader uniforms once
+        
+        # Set water shader uniforms
         self.water_time += 0.016
-        self.atlas.use(0)  # ensure atlas bound for water shader
+        self.atlas.use(0)
         self.waterp['u_mvp'].write(mvp.T.astype(np.float32).tobytes())
-        self.waterp['u_time'].value    = self.water_time
-        self.waterp['u_sun'].value     = self.prog['u_sun'].value
-        self.waterp['u_ambient'].value  = self.prog['u_ambient'].value
-        self.waterp['u_tint'].value    = self.prog['u_tint'].value
-        self.waterp['u_tex'].value     = 0
+        self.waterp['u_sun'].value = self.prog['u_sun'].value
+        self.waterp['u_ambient'].value = self.prog['u_ambient'].value
+        self.waterp['u_tint'].value = self.prog['u_tint'].value
+        self.waterp['u_tex'].value = 0
+        
         for k2, entry in trans_chunks:
-            # Use animated water VAO if available, else fallback
             if len(entry) > 6 and entry[5] > 0:
                 entry[6].render(moderngl.TRIANGLES, vertices=entry[5])
             elif entry[5] > 0:
@@ -692,49 +1104,88 @@ class Renderer:
                     positions = positions[:200]
                 self._torch_positions = positions
                 self._torch_scan_t = self.water_time
+            
             positions = self._torch_positions
             if positions:
                 fx, fy, fz = player.forward()
-                fl = math.sqrt(fx*fx+fy*fy+fz*fz);  fx/=fl; fy/=fl; fz/=fl
-                rx,ry,rz = fy*0-fz*1, fz*0-fx*0, fx*1-fy*0
-                rl = math.sqrt(rx*rx+ry*ry+rz*rz)
-                if rl < 1e-6: rx,ry,rz = 1.,0.,0.
-                else:         rx/=rl; ry/=rl; rz/=rl
-                ux,uy,uz = ry*fz-rz*fy, rz*fx-rx*fz, rx*fy-ry*fx
+                fl = math.sqrt(fx*fx + fy*fy + fz*fz)
+                fx /= fl
+                fy /= fl
+                fz /= fl
+                rx, ry, rz = fy*0 - fz*1, fz*0 - fx*0, fx*1 - fy*0
+                rl = math.sqrt(rx*rx + ry*ry + rz*rz)
+                if rl < 1e-6:
+                    rx, ry, rz = 1.0, 0.0, 0.0
+                else:
+                    rx /= rl
+                    ry /= rl
+                    rz /= rl
+                ux, uy, uz = ry*fz - rz*fy, rz*fx - rx*fz, rx*fy - ry*fx
 
-                proj = _persp(FOV, w/h, 0.05, 800.)
+                proj = _persp(FOV, w/h, 0.05, 800.0)
                 view = player.view_mat()
-                mvp  = proj @ view
+                mvp = proj @ view
                 self.sunp['u_mvp'].write(mvp.T.astype(np.float32).tobytes())
-                self.torch_tex.use(0);  self.sunp['u_tex'].value = 0
+                self.torch_tex.use(0)
+                self.sunp['u_tex'].value = 0
 
                 def write_bb(vbo, center, size):
-                    cx2,cy2,cz2 = center
-                    sx2=rx*size; sy2=ry*size; sz2=rz*size
-                    ux2=ux*size; uy2=uy*size; uz2=uz*size
-                    p0=(cx2-sx2-ux2,cy2-sy2-uy2,cz2-sz2-uz2)
-                    p1=(cx2+sx2-ux2,cy2+sy2-uy2,cz2+sz2-uz2)
-                    p2=(cx2+sx2+ux2,cy2+sy2+uy2,cz2+sz2+uz2)
-                    p3=(cx2-sx2+ux2,cy2-sy2+uy2,cz2-sz2+uz2)
-                    data = np.array([*p0,0.,1.,*p1,1.,1.,*p2,1.,0.,
-                                      *p0,0.,1.,*p2,1.,0.,*p3,0.,0.], dtype=np.float32)
+                    cx2, cy2, cz2 = center
+                    sx2 = rx * size
+                    sy2 = ry * size
+                    sz2 = rz * size
+                    ux2 = ux * size
+                    uy2 = uy * size
+                    uz2 = uz * size
+                    p0 = (cx2 - sx2 - ux2, cy2 - sy2 - uy2, cz2 - sz2 - uz2)
+                    p1 = (cx2 + sx2 - ux2, cy2 + sy2 - uy2, cz2 + sz2 - uz2)
+                    p2 = (cx2 + sx2 + ux2, cy2 + sy2 + uy2, cz2 + sz2 + uz2)
+                    p3 = (cx2 - sx2 + ux2, cy2 - sy2 + uy2, cz2 - sz2 + uz2)
+                    data = np.array([
+                        *p0, 0.0, 1.0,
+                        *p1, 1.0, 1.0,
+                        *p2, 1.0, 0.0,
+                        *p0, 0.0, 1.0,
+                        *p2, 1.0, 0.0,
+                        *p3, 0.0, 0.0
+                    ], dtype=np.float32)
                     vbo.write(data.tobytes())
 
                 for i, pos in enumerate(positions):
                     size = 0.12 + 0.03 * math.sin(self.water_time * 6.0 + i)
                     write_bb(self.torch_vbo, pos, size)
                     self.torch_vao.render(moderngl.TRIANGLES)
+        
         self.ctx.depth_mask = True
 
         if ENABLE_WIREFRAME:
-            self.ctx.wireframe  = True
+            self.ctx.wireframe = True
             self.ctx.line_width = EDGE_WIDTH
             self.prog['u_ambient'].value = 1.0
-            self.prog['u_tint'].value    = EDGE_COLOR
+            self.prog['u_tint'].value = EDGE_COLOR
             for k2, (vao, vbo, nv) in self._vaos.items():
-                if nv > 0: vao.render(moderngl.TRIANGLES, vertices=nv)
+                if nv > 0:
+                    vao.render(moderngl.TRIANGLES, vertices=nv)
             self.ctx.wireframe = False
 
+        self.ctx.depth_mask = True
+
+    # CRITICAL: Draw breaking overlay LAST - after everything else
+    # Recreate mvp here to ensure it's correct
+        proj = _persp(FOV, w/h, 0.05, 800.)
+        view = player.view_mat()
+        mvp = proj @ view
+        self.draw_breaking_overlay(world, player, mvp)
+
+        if ENABLE_WIREFRAME:
+            self.ctx.wireframe = True
+            self.ctx.line_width = EDGE_WIDTH
+            self.prog['u_ambient'].value = 1.0
+            self.prog['u_tint'].value = EDGE_COLOR
+            for k2, (vao, vbo, nv) in self._vaos.items():
+                if nv > 0:
+                    vao.render(moderngl.TRIANGLES, vertices=nv)
+            self.ctx.wireframe = False
 
 # ═══════════════════════════════════════════════════════════════════════
 #  UI SYSTEM  (unchanged from original)
@@ -1567,6 +2018,15 @@ class CraftingTableScreen:
         return None
     def hit_craft_output(self,x,y):
         return bool(self._craft_out and self._craft_out.hit(x,y))
+    
+    def clear_crafting_grid(self):
+        """Clear all items from crafting grid."""
+        self._craft_items = [None] * 9
+        self._craft_result = None
+        self._craft_out_count = 0
+        self._craft_match = None
+        if self._craft_out:
+            self._craft_out.set(None, 0)
     def take_craft_output(self,inv, take_all=False, to_inventory=False):
         if not self._craft_result or self._craft_out_count <= 0 or not self._craft_match:
             return None
@@ -1685,6 +2145,25 @@ class FurnaceScreen:
             d=s._slots[i]; su.set(d[0],d[1]) if d else su.set(None,0)
         for j,su in enumerate(self._hb_slots):
             d=s._slots[27+j]; su.set(d[0],d[1]) if d else su.set(None,0)
+    
+    def clear_furnace(self):
+        """Clear all items from furnace slots."""
+        self.input_item = None
+        self.input_count = 0
+        self.fuel_item = None
+        self.fuel_count = 0
+        self.output_item = None
+        self.output_count = 0
+        self.burn_time = 0.0
+        self.burn_max = 0.0
+        self.cook_time = 0.0
+        if self._in_slot:
+            self._in_slot.set(None, 0)
+        if self._fuel_slot:
+            self._fuel_slot.set(None, 0)
+        if self._out_slot:
+            self._out_slot.set(None, 0)
+    
     def _update_bars(self):
         ratio=max(0.,min(1.,self.burn_time/self.burn_max)) if self.burn_max>0 else 0.
         self._flame_fg.height=int(self._flame_h*ratio)
@@ -1784,12 +2263,102 @@ class UIManager:
         self._hide_all(); self._mode=self.FURNACE; self._fur_scr.show(self._win.inventory)
         self._win.set_exclusive_mouse(False)
     def close(self):
+        # Return crafting grid items to inventory before closing
+        if self._mode == self.CRAFT:
+            self._return_craft_items_to_inventory()
+        elif self._mode == self.FURNACE:
+            self._return_furnace_items_to_inventory()
+        
         if self._drag.active:
-            self._win.inventory.slots.add(self._drag.item,self._drag.count); self._drag.stop()
-        self._hide_all(); self._mode=self.NONE; self._win.set_exclusive_mouse(True)
+            self._win.inventory.slots.add(self._drag.item, self._drag.count)
+            self._drag.stop()
+        self._hide_all()
+        self._mode = self.NONE
+        self._win.set_exclusive_mouse(True)
+
+    def _return_furnace_items_to_inventory(self):
+        """Return all items from furnace slots back to player inventory."""
+        inv = self._win.inventory
+        fs = self._fur_scr
+        
+        # Return input slot
+        if fs.input_item and fs.input_count > 0:
+            leftover = inv.slots.add(fs.input_item, fs.input_count)
+            fs.input_item = None
+            fs.input_count = 0
+        
+        # Return fuel slot
+        if fs.fuel_item and fs.fuel_count > 0:
+            leftover = inv.slots.add(fs.fuel_item, fs.fuel_count)
+            fs.fuel_item = None
+            fs.fuel_count = 0
+        
+        # Return output slot (if any)
+        if fs.output_item and fs.output_count > 0:
+            leftover = inv.slots.add(fs.output_item, fs.output_count)
+            fs.output_item = None
+            fs.output_count = 0
+        
+        # Reset progress bars
+        fs.burn_time = 0.0
+        fs.burn_max = 0.0
+        fs.cook_time = 0.0
+        
+        # Update UI
+        fs._in_slot.set(None, 0)
+        fs._fuel_slot.set(None, 0)
+        fs._out_slot.set(None, 0)
+        fs._update_bars()
+        fs.refresh(inv)
+
+    def _return_craft_items_to_inventory(self):
+        """Return all items from crafting grid back to player inventory."""
+        inv = self._win.inventory
+        for i, item in enumerate(self._cft_scr._craft_items):
+            if item:
+                item_id, count = item
+                leftover = inv.slots.add(item_id, count)
+                if leftover > 0:
+                    # If inventory full, drop items on ground
+                    print(f"Warning: {leftover} {item_id} could not be returned (inventory full)")
+        # Clear crafting grid
+        self._cft_scr._craft_items = [None] * 9
+        self._cft_scr._update_craft_output()
+        self._cft_scr.refresh(inv)
+
+    def _return_furnace_items_to_inventory(self):
+        """Return all items from furnace slots back to player inventory."""
+        inv = self._win.inventory
+        fs = self._fur_scr
+        
+        # Return input slot
+        if fs.input_item and fs.input_count > 0:
+            leftover = inv.slots.add(fs.input_item, fs.input_count)
+            fs.input_item = None
+            fs.input_count = 0
+        
+        # Return fuel slot
+        if fs.fuel_item and fs.fuel_count > 0:
+            leftover = inv.slots.add(fs.fuel_item, fs.fuel_count)
+            fs.fuel_item = None
+            fs.fuel_count = 0
+        
+        # Return output slot (if any)
+        if fs.output_item and fs.output_count > 0:
+            leftover = inv.slots.add(fs.output_item, fs.output_count)
+            fs.output_item = None
+            fs.output_count = 0
+        
+        # Update UI
+        fs._in_slot.set(None, 0)
+        fs._fuel_slot.set(None, 0)
+        fs._out_slot.set(None, 0)
+        fs.refresh(inv)
     def toggle_inv(self):
-        if self._mode==self.NONE: self.open_inv()
-        else: self.close()
+        if self._mode == self.NONE:
+            self.open_inv()
+        else:
+            self.close()  # This will now return items properly
     def tick(self,dt): self._fur_scr.tick(dt,self._win.inventory)
     def update_hud(self, player, world, fps_buf, dt=0.0):
         fps = sum(fps_buf) / len(fps_buf) if fps_buf else 0
@@ -2141,7 +2710,9 @@ class GameWindow(pyglet.window.Window):
         self.inventory.slots.add(BlockType.COBBLESTONE,   20)
         self.inventory.slots.add(BlockType.CRAFTING_TABLE, 1)
         self.inventory.slots.add(BlockType.FURNACE,        1)
-
+        self.inventory.slots.add(BlockType.OAK_SAPLING,    5)
+        self.inventory.slots.add(BlockType.BIRCH_SAPLING,  5)
+        self.inventory.slots.add(BlockType.SPRUCE_SAPLING, 5)
         self.mob_manager = None
         if ENABLE_MOBS:
             self.mob_manager = MobManager()
@@ -2180,8 +2751,10 @@ class GameWindow(pyglet.window.Window):
         if self.mob_manager:
             spawn_pos = MobVec3(self.player.x, self.player.y, self.player.z)
             self.mob_manager.spawn_initial_passive(spawn_pos, self.world, count=6)
-
+        self.current_breaking_block = None
+        self.break_start_time = 0.0
         self.keys      = set()
+        self._left_mouse_down = False
         self._captured = False
         self._t_prev   = _time.perf_counter()
         self._fps_buf  = deque(maxlen=30)
@@ -2190,41 +2763,124 @@ class GameWindow(pyglet.window.Window):
         pyglet.clock.schedule_interval(self._tick, 1.0 / 60.0)
 
     def _stream(self):
+        """Generate and upload chunk meshes as the player moves."""
         cx0, cz0 = World.world_to_chunk(self.player.x, self.player.z)
-        for ddx in range(-VIEW_DISTANCE, VIEW_DISTANCE+1):
-            for ddz in range(-VIEW_DISTANCE, VIEW_DISTANCE+1):
-                self.world.get_or_gen(cx0+ddx, cz0+ddz)
-        to_del = [k for k in list(self.world.chunks)
-                  if abs(k[0]-cx0)>VIEW_DISTANCE+2 or abs(k[1]-cz0)>VIEW_DISTANCE+2]
+        
+        # Generate new chunks within view distance
+        for ddx in range(-VIEW_DISTANCE, VIEW_DISTANCE + 1):
+            for ddz in range(-VIEW_DISTANCE, VIEW_DISTANCE + 1):
+                self.world.get_or_gen(cx0 + ddx, cz0 + ddz)
+        
+        # Remove chunks outside view distance
+        to_del = []
+        for k in list(self.world.chunks):
+            if abs(k[0] - cx0) > VIEW_DISTANCE + 2 or abs(k[1] - cz0) > VIEW_DISTANCE + 2:
+                to_del.append(k)
+        
         for k in to_del:
-            self.ren.remove(k);  del self.world.chunks[k]
+            self.ren.remove(k)
+            del self.world.chunks[k]
+        
+        # Upload dirty chunk meshes
         uploaded = 0
         while self.world.dirty_queue and uploaded < MESH_PER_FRAME:
             ch = self.world.dirty_queue.popleft()
-            if ch.dirty: self.ren.upload(ch, self.world);  uploaded += 1
+            if ch.dirty:
+                self.ren.upload(ch, self.world)
+                uploaded += 1
 
+    def on_mouse_release(self, x, y, btn, mod):
+        if btn == mouse.LEFT and hasattr(self, 'current_breaking_block') and self.current_breaking_block:
+            self.world.cancel_breaking_block(*self.current_breaking_block)
+            self.current_breaking_block = None
+            
     def _tick(self, dt):
         now = _time.perf_counter()
-        dt  = min(now - self._t_prev, 0.05);  self._t_prev = now
+        dt = min(now - self._t_prev, 0.05)
+        self._t_prev = now
         self._fps_buf.append(1.0 / max(dt, 1e-4))
-        self.world.tick(dt);  self._ui.tick(dt)
-        mx = mz = 0.
+        
+        # Update world and UI
+        self.world.tick(dt)
+        self._ui.tick(dt)
+        
+        # Update block breaking animation
+        if hasattr(self, 'current_breaking_block') and self.current_breaking_block:
+            hx, hy, hz = self.current_breaking_block
+            # Check if block still exists
+            if self.world.get_block(hx, hy, hz) == 0:
+                self.world.cancel_breaking_block(hx, hy, hz)
+                self.current_breaking_block = None
+            else:
+                # Only continue breaking if left mouse button is still pressed
+                if hasattr(self, '_left_mouse_down') and self._left_mouse_down:
+                    should_break = self.world.update_breaking_block(hx, hy, hz, dt)
+                    if should_break:
+                        # Actually break the block
+                        bt = self.world.get_block(hx, hy, hz)
+                        if bt and bt < N_BLOCK_TYPES:
+                            bname = _BT_LIST[bt]
+                            props = BLOCK_DATA.get(bname, {})
+                            if not props.get("unbreakable", False):
+                                # Get drops based on block type
+                                if bname in (BlockType.OAK_LEAVES, BlockType.BIRCH_LEAVES, BlockType.SPRUCE_LEAVES):
+                                    drops = self.world.get_leaf_drops(bname)
+                                    for item, count in drops:
+                                        self.inventory.slots.add(item, count)
+                                else:
+                                    drop = props.get("drops")
+                                    if drop:
+                                        self.inventory.slots.add(drop, 1)
+                                
+                                # Remove the block
+                                self.world.set_block(hx, hy, hz, 0)
+                                self._ui._hotbar.refresh(self.inventory)
+                        
+                        # Remove from breaking animation
+                        self.world.remove_breaking_block(hx, hy, hz)
+                        self.current_breaking_block = None
+                else:
+                    # Mouse was released, cancel breaking animation
+                    self.world.cancel_breaking_block(hx, hy, hz)
+                    self.current_breaking_block = None
+        
+        # Collect leaf drops near player (from decaying leaves)
+        drops = self.world.collect_nearby_drops(self.player.x, self.player.y, self.player.z)
+        for item, count in drops:
+            self.inventory.slots.add(item, count)
+            self._ui._hotbar.refresh(self.inventory)
+        
+        # Handle player movement input
+        mx = mz = 0.0
         if not self._ui.is_open:
-            if key.W in self.keys: mz += 1.
-            if key.S in self.keys: mz -= 1.
-            if key.A in self.keys: mx -= 1.
-            if key.D in self.keys: mx += 1.
-            mag = math.sqrt(mx*mx + mz*mz)
-            if mag > 0: mx /= mag;  mz /= mag
-        self.player.update(dt, self.world,
-                           self.keys if not self._ui.is_open else set(), mx, mz)
-        player_mob_pos = MobVec3(self.player.x, self.player.y, self.player.z)
+            if key.W in self.keys:
+                mz += 1.0
+            if key.S in self.keys:
+                mz -= 1.0
+            if key.A in self.keys:
+                mx -= 1.0
+            if key.D in self.keys:
+                mx += 1.0
+            
+            # Normalize diagonal movement
+            mag = math.sqrt(mx * mx + mz * mz)
+            if mag > 0:
+                mx /= mag
+                mz /= mag
+        
+        # Update player
+        self.player.update(dt, self.world, self.keys if not self._ui.is_open else set(), mx, mz)
+        
+        # Update mobs if enabled
         if self.mob_manager:
-            self.mob_manager.update_mobs(dt, player_mob_pos, self.world,
-                                         self.player, self.world.time_of_day)
+            player_mob_pos = MobVec3(self.player.x, self.player.y, self.player.z)
+            self.mob_manager.update_mobs(dt, player_mob_pos, self.world, self.player, self.world.time_of_day)
+        
+        # Stream chunks (generate and upload meshes)
         self._stream()
+        
+        # Update HUD
         self._ui.update_hud(self.player, self.world, self._fps_buf, dt)
-
     def on_draw(self):
         self.ren.draw(self.player, self.world, self.width, self.height)
         self.ctx.disable(moderngl.DEPTH_TEST)
@@ -2242,8 +2898,11 @@ class GameWindow(pyglet.window.Window):
     def on_key_press(self, sym, mod):
         self.keys.add(sym)
         if sym == key.ESCAPE:
-            if self._ui.is_open: self._ui.close()
-            else: self.set_exclusive_mouse(False);  self._captured = False
+            if self._ui.is_open:
+                self._ui.close()
+            else:
+                self.set_exclusive_mouse(False)
+                self._captured = False
         if sym == key.E: self._ui.toggle_inv()
         if sym == key.B:
             global ENABLE_WIREFRAME;  ENABLE_WIREFRAME = not ENABLE_WIREFRAME
@@ -2282,20 +2941,30 @@ class GameWindow(pyglet.window.Window):
             self._ui.on_press(x, y, btn, mod);  return
         if not self._captured:
             self.set_exclusive_mouse(True);  self._captured = True;  return
-        rc = self.player.raycast(self.world)
-        if rc is None: return
-        hit, norm, prev = rc
-        hx, hy, hz = hit
         if btn == mouse.LEFT:
-            bt = self.world.get_block(hx, hy, hz)
-            if bt and bt < N_BLOCK_TYPES:
-                bname = _BT_LIST[bt];  props = BLOCK_DATA.get(bname, {})
-                if not props.get("unbreakable", False):
-                    drop = props.get("drops")
-                    if drop:
-                        self.inventory.slots.add(drop, 1);  self._ui._hotbar.refresh(self.inventory)
-                    self.world.set_block(hx, hy, hz, 0)
+            self._left_mouse_down = True
+        if btn == mouse.LEFT:
+            # Start breaking animation
+            rc = self.player.raycast(self.world)
+            if rc is None: return
+            hit, norm, prev = rc
+            hx, hy, hz = hit
+            
+            self.world.start_breaking_block(hx, hy, hz)
+            self.current_breaking_block = (hx, hy, hz)
+            self.break_start_time = _time.time()
+            # Remove or comment out the break_start_time line if not used
+            
         elif btn == mouse.RIGHT:
+            # Cancel any ongoing breaking
+            if hasattr(self, 'current_breaking_block'):
+                self.world.cancel_breaking_block(*self.current_breaking_block)
+                self.current_breaking_block = None
+            
+            rc = self.player.raycast(self.world)
+            if rc is None: return
+            hit, norm, prev = rc
+            hx, hy, hz = hit
             bt = self.world.get_block(hx, hy, hz)
             if bt and bt < N_BLOCK_TYPES:
                 bname = _BT_LIST[bt]
@@ -2314,8 +2983,13 @@ class GameWindow(pyglet.window.Window):
                     self.inventory.slots.consume_selected(1)
                     self._ui._hotbar.refresh(self.inventory)
 
-    def on_mouse_release(self, x, y, btn, mod): pass
-
+    def on_mouse_release(self, x, y, btn, mod):
+        if btn == mouse.LEFT:
+            self._left_mouse_down = False
+            # Cancel breaking animation
+            if hasattr(self, 'current_breaking_block') and self.current_breaking_block:
+                self.world.cancel_breaking_block(*self.current_breaking_block)
+                self.current_breaking_block = None
     def on_resize(self, w, h):
         self.ctx.viewport = (0, 0, w, h);  self._ui.resize(w, h)
 

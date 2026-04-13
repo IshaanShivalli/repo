@@ -86,32 +86,33 @@ def river_info(wx: int, wz: int, height: int, seed: int) -> int:
 
 @njit(cache=True)
 def river_depth(wx: int, wz: int, seed: int) -> int:
-    # Depth varies between 3 and 5 blocks
-    d = _grad_noise(float(wx) * 0.07, float(wz) * 0.07, seed ^ 0xBEEF)
-    return 3 if d < -0.2 else (4 if d < 0.4 else 5)
-
+    # Variable depth between 2 and 6 blocks
+    d1 = _grad_noise(float(wx) * 0.05, float(wz) * 0.05, seed ^ 0xBEEF)
+    d2 = _grad_noise(float(wx) * 0.15, float(wz) * 0.15, seed ^ 0xDEAD)
+    depth_var = (d1 * 0.7 + d2 * 0.3 + 1) * 0.5  # Range 0-1
+    return 2 + int(depth_var * 5)  # 2-7 blocks deep
 
 @njit(cache=True)
 def carve_river(blk, dx: int, dz: int, height: int,
                 river_y: int, depth: int, ID_WATER: int, ID_DIRT: int,
                 H: int) -> None:
-    """
-    Carve a river channel:
-      - Remove all terrain blocks from river_y+1 up to height (make channel)
-      - Place water at river_y (flat surface, same Y every column)
-      - Dirt river bed one block below
-    """
-    # Air channel above water
+    """Carve a river channel with sloped banks."""
     ry = int(river_y)
+    
+    # Carve main channel
     for y in range(ry + 1, min(height + 1, H)):
         blk[dx, y, dz] = 0
-
-    # Water — always at the same world Y
+    
+    # Water at river level
     if 0 <= ry < H:
         blk[dx, ry, dz] = ID_WATER
-
-    # Soft river bed
-    # Thin river bed: only one dirt layer
-    bed_y = ry - 1
-    if 0 <= bed_y < H:
-        blk[dx, bed_y, dz] = ID_DIRT
+    
+    # Create sloped banks
+    bank_depth = max(1, depth // 2)
+    for y in range(ry - bank_depth, ry):
+        if 0 <= y < H:
+            blk[dx, y, dz] = ID_DIRT
+    
+    # Add sand/gravel on river bottom
+    if ry - depth > 0:
+        blk[dx, ry - depth, dz] = ID_DIRT

@@ -14,7 +14,40 @@ from numba import njit
 from settings import SEA_LEVEL, BEDROCK_LEVEL, OCEAN_FLOOR, CHUNK_HEIGHT
 
 
-# ── Noise ────────────────────────────────────────────────────────────────────
+# ── Noise functions ─────────────────────────────────────────────────────────
+
+@njit(cache=True)
+def _hash(x: int, z: int, seed: int) -> float:
+    """Fast integer hash → float in [-1, 1]."""
+    n = (x * 1664525 + z * 1013904223 + seed) & 0xFFFFFFFF
+    n ^= (n >> 16)
+    n = (n * 0x45d9f3b) & 0xFFFFFFFF
+    n ^= (n >> 16)
+    return (n / 0x7FFFFFFF) - 1.0
+
+
+@njit(cache=True)
+def _smooth(t: float) -> float:
+    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+
+
+@njit(cache=True)
+def _vn(x: float, z: float, seed: int) -> float:
+    """Value noise, returns [-1, 1]."""
+    ix = int(math.floor(x))
+    iz = int(math.floor(z))
+    fx = x - float(ix)
+    fz = z - float(iz)
+    ux = _smooth(fx)
+    uz = _smooth(fz)
+    v00 = _hash(ix, iz, seed)
+    v10 = _hash(ix + 1, iz, seed)
+    v01 = _hash(ix, iz + 1, seed)
+    v11 = _hash(ix + 1, iz + 1, seed)
+    a = v00 + ux * (v10 - v00)
+    b = v01 + ux * (v11 - v01)
+    return a + uz * (b - a)
+
 
 @njit(cache=True)
 def _sea_noise(x: float, z: float, seed: int) -> float:
@@ -28,10 +61,21 @@ def _sea_noise(x: float, z: float, seed: int) -> float:
 
 @njit(cache=True)
 def ocean_floor_height(wx: int, wz: int, seed: int) -> int:
-    """Varied ocean floor depth between OCEAN_FLOOR and SEA_LEVEL-4."""
-    n = _sea_noise(float(wx) * 0.05, float(wz) * 0.05, seed ^ 0xABCD)
-    h = OCEAN_FLOOR + int((n * 0.5 + 0.5) * (SEA_LEVEL - 6 - OCEAN_FLOOR))
-    return max(OCEAN_FLOOR, min(SEA_LEVEL - 4, h))
+    """Varied ocean floor with hills and trenches."""
+    # Add more variation to ocean floor
+    n1 = _vn(float(wx) * 0.03, float(wz) * 0.03, seed ^ 0xABCD)
+    n2 = _vn(float(wx) * 0.08, float(wz) * 0.08, seed ^ 0x1234)
+    n3 = _vn(float(wx) * 0.015, float(wz) * 0.015, seed ^ 0x5678)
+    
+    # Combine noises for varied terrain
+    combined = n1 * 0.5 + n2 * 0.3 + n3 * 0.2
+    
+    # Range between OCEAN_FLOOR-8 and SEA_LEVEL-2
+    min_floor = max(BEDROCK_LEVEL + 5, OCEAN_FLOOR - 8)
+    max_floor = SEA_LEVEL - 2
+    
+    h = min_floor + int((combined + 1) * 0.5 * (max_floor - min_floor))
+    return max(min_floor, min(max_floor, h))
 
 
 @njit(cache=True)

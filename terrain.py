@@ -101,8 +101,6 @@ def _continent(wx: int, wz: int, seed: int) -> float:
     return _fbm((wx_f + warp_x) * 0.005, (wz_f + warp_z) * 0.005,
                 seed ^ 0x3333, 4, 2.0, 0.5)
 
-# Change this line in _biome_at:
-
 
 @njit(cache=True)
 def _terrain_height(wx: int, wz: int, seed: int) -> int:
@@ -135,7 +133,7 @@ def _biome_at(wx: int, wz: int, seed: int) -> int:
       0 = plains   1 = forest   2 = desert   3 = snowy taiga
       4 = ocean    5 = birch forest
     """
-    if _continent(wx, wz, seed) < -0.08:   # ← changed from -0.20 to -0.08
+    if _continent(wx, wz, seed) < -0.08:
         return 4   # ocean
 
     # Temperature noise (smooth, large scale)
@@ -176,11 +174,50 @@ def _is_coast(wx: int, wz: int, seed: int) -> bool:
     return False
 
 
+# ═══════════════════════════════════════════════════════════════════════
+#  ORE VEIN GENERATION HELPERS
+# ═══════════════════════════════════════════════════════════════════════
+
 @njit(cache=True)
-def ocean_floor_height(wx: int, wz: int, seed: int) -> int:
-    n = _vn(float(wx) * 0.05, float(wz) * 0.05, seed ^ 0xABCD)
-    h = OCEAN_FLOOR + int((n * 0.5 + 0.5) * (SEA_LEVEL - 6 - OCEAN_FLOOR))
-    return max(OCEAN_FLOOR, min(SEA_LEVEL - 6, h))
+def _place_ore_vein(blk, cx: int, cz: int, dx: int, dz: int, start_y: int,
+                     seed: int, ore_id: int, vein_size: int,
+                     min_y: int, max_y: int) -> None:
+    """
+    Place an ore vein starting from the given position.
+    """
+    S = CHUNK_SIZE
+    H = CHUNK_HEIGHT
+    
+    placed = 0
+    attempts = 0
+    
+    while placed < vein_size and attempts < vein_size * 6:
+        attempts += 1
+        
+        # Generate random offsets for this attempt
+        off_hash = ((seed ^ (cx * 73129) ^ (cz * 95143) ^ (dx * attempts * 7) ^ (dz * attempts * 13)) & 0xFFFFFFFF)
+        
+        # Spread outward in 3D - creates natural clusters
+        x_off = ((off_hash >> 0) & 0x7) - 3
+        z_off = ((off_hash >> 8) & 0x7) - 3
+        y_off = ((off_hash >> 16) & 0x5) - 2
+        
+        nx = dx + x_off
+        ny = start_y + y_off
+        nz = dz + z_off
+        
+        # Check bounds
+        if not (0 <= nx < S and 0 <= ny < H and 0 <= nz < S):
+            continue
+        
+        # Check Y limits
+        if ny < min_y or ny > max_y:
+            continue
+        
+        # Only replace stone (ID_STONE = 3)
+        if blk[nx, ny, nz] == 3:  # ID_STONE
+            blk[nx, ny, nz] = ore_id
+            placed += 1
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -201,6 +238,7 @@ def gen_chunk(cx: int, cz: int, seed: int,
     blk = np.zeros((S, H, S), dtype=np.uint8)
     lcg = (seed ^ (cx * 73856093) ^ (cz * 19349663)) & 0xFFFFFFFF
 
+    # First pass: generate terrain base
     for dx in range(S):
         for dz in range(S):
             wx    = cx * S + dx
@@ -211,18 +249,6 @@ def gen_chunk(cx: int, cz: int, seed: int,
             if biome == 4:
                 lcg = fill_ocean_column(blk, dx, dz, wx, wz, seed, lcg,
                     ID_BEDROCK, ID_STONE, ID_SAND_OCEAN, ID_WATER)
-                floor_y = ocean_floor_height(wx, wz, seed)
-                for _ in range(3):
-                    lcg = (lcg * 1664525 + 1013904223) & 0xFFFFFFFF
-                    oy  = BEDROCK_LEVEL + 3 + int(lcg & 0x1F)
-                    oy  = min(oy, floor_y - 4)
-                    if oy >= BEDROCK_LEVEL + 3 and blk[dx, oy, dz] == ID_STONE:
-                        lcg = (lcg * 1664525 + 1013904223) & 0xFFFFFFFF
-                        rv  = lcg & 0xFF
-                        if   rv < 20: blk[dx, oy, dz] = ID_COAL
-                        elif rv < 32: blk[dx, oy, dz] = ID_IRON
-                        elif rv < 35 and oy < SEA_LEVEL - 8:  blk[dx, oy, dz] = ID_GOLD
-                        elif rv < 37 and oy < SEA_LEVEL - 16: blk[dx, oy, dz] = ID_DIAMOND
                 continue
 
             # ── Land biomes ──────────────────────────────────────────────
@@ -240,7 +266,7 @@ def gen_chunk(cx: int, cz: int, seed: int,
             elif biome == 3:
                 surf = ID_STONE if height >= SEA_LEVEL + 22 else ID_SNOW
             else:
-                surf = ID_GRASS   # plains, forest, birch forest all use grass
+                surf = ID_GRASS
 
             # ── Column fill ───────────────────────────────────────────────
             for y in range(H):
@@ -264,19 +290,15 @@ def gen_chunk(cx: int, cz: int, seed: int,
                     blk[dx, y, dz] = surf
 
             # ── Cave carving ──────────────────────────────────────────────
-            # Spaghetti caves: two noise fields — carve where both are near 0
-            # (their product creates thin worm-like tubes)
             for y in range(BEDROCK_LEVEL + 3, height - 1):
                 fy = float(y); fx = float(wx); fz = float(wz)
 
-                # Spaghetti worm caves (main cave network)
                 n1 = _noise3(fx * 1.0, fy * 1.0, fz * 1.0, seed ^ 0x1122)
                 n2 = _noise3(fx * 1.0, fy * 1.0, fz * 1.0, seed ^ 0x3344)
-                if n1 * n1 + n2 * n2 < 0.04:   # thin tubes where both near 0
+                if n1 * n1 + n2 * n2 < 0.04:
                     blk[dx, y, dz] = 0
                     continue
 
-                # Big chambers: single-field threshold (20% more open than before)
                 n3 = _noise3(fx * 0.6, fy * 0.7, fz * 0.6, seed ^ 0x5566)
                 big = _vn(fx * 0.05, fz * 0.05, seed ^ 0x7788) > 0.3
                 thresh = 0.30 if big else 0.40
@@ -284,7 +306,6 @@ def gen_chunk(cx: int, cz: int, seed: int,
                     blk[dx, y, dz] = 0
                     continue
 
-                # Vertical shafts (ravine-style, ~8% of columns)
                 shaft_v = _cave_noise_v(fx, fy, fz, seed)
                 if shaft_v > 0.58 and y > 10:
                     shaft_w = _vn(fx * 0.25, fz * 0.25, seed ^ 0x9900)
@@ -292,7 +313,6 @@ def gen_chunk(cx: int, cz: int, seed: int,
                         blk[dx, y, dz] = 0
                         continue
 
-                # Near-surface cave openings
                 if y >= height - 10:
                     open_n = _noise3(fx, fy, fz, seed ^ 0xBBCC)
                     if open_n > 0.32:
@@ -304,20 +324,55 @@ def gen_chunk(cx: int, cz: int, seed: int,
                 carve_river(blk, dx, dz, height, _river_y, _river_d,
                             ID_WATER, ID_DIRT, H)
 
-            # Ore placement (more variety — 6 attempts per column)
-            for _ in range(6):
-                lcg = (lcg * 1664525 + 1013904223) & 0xFFFFFFFF
-                oy  = BEDROCK_LEVEL + 3 + int(lcg & 0x3F) % (height - BEDROCK_LEVEL - 6)
-                oy  = max(BEDROCK_LEVEL + 3, min(oy, height - 4))
-                if blk[dx, oy, dz] == ID_STONE:
-                    lcg = (lcg * 1664525 + 1013904223) & 0xFFFFFFFF
-                    rv  = lcg & 0xFF
-                    if   rv < 18: blk[dx, oy, dz] = ID_COAL
-                    elif rv < 30: blk[dx, oy, dz] = ID_IRON
-                    elif rv < 33 and oy < SEA_LEVEL - 6:  blk[dx, oy, dz] = ID_GOLD
-                    elif rv < 35 and oy < SEA_LEVEL - 14: blk[dx, oy, dz] = ID_DIAMOND
+    # Second pass: generate ore veins (after terrain is complete)
+    for dx in range(S):
+        for dz in range(S):
+            wx = cx * S + dx
+            wz = cz * S + dz
+            
+            # Skip ocean biomes for ore veins
+            if _biome_at(wx, wz, seed) == 4:
+                continue
+            
+            # Get the height at this position
+            height = _terrain_height(wx, wz, seed)
+            
+            # === COAL VEINS (most common, 4-12 blocks) ===
+            coal_hash = ((seed ^ (wx * 7919) ^ (wz * 7901)) & 0xFFFFFFFF) % 100
+            if coal_hash < 18:
+                vein_size = 4 + ((coal_hash * 7) % 9)
+                start_y = BEDROCK_LEVEL + 5 + ((coal_hash * 13) % (height - 15))
+                _place_ore_vein(blk, cx, cz, dx, dz, start_y, seed, ID_COAL, vein_size,
+                               BEDROCK_LEVEL + 3, CHUNK_HEIGHT - 10)
+            
+            # === IRON VEINS (less common, 3-8 blocks) ===
+            iron_hash = ((seed ^ (wx * 7927) ^ (wz * 7919)) & 0xFFFFFFFF) % 100
+            if iron_hash < 12:
+                vein_size = 3 + ((iron_hash * 5) % 6)
+                start_y = BEDROCK_LEVEL + 5 + ((iron_hash * 17) % (min(height - 10, SEA_LEVEL - 4)))
+                _place_ore_vein(blk, cx, cz, dx, dz, start_y, seed, ID_IRON, vein_size,
+                               BEDROCK_LEVEL + 3, SEA_LEVEL - 4)
+            
+            # === GOLD VEINS (rare, 2-6 blocks) ===
+            gold_hash = ((seed ^ (wx * 7933) ^ (wz * 7927)) & 0xFFFFFFFF) % 100
+            if gold_hash < 8:
+                vein_size = 2 + ((gold_hash * 3) % 5)
+                start_y = BEDROCK_LEVEL + 8 + ((gold_hash * 19) % (min(height - 15, SEA_LEVEL - 12)))
+                _place_ore_vein(blk, cx, cz, dx, dz, start_y, seed, ID_GOLD, vein_size,
+                               BEDROCK_LEVEL + 6, SEA_LEVEL - 12)
+            
+            # === DIAMOND VEINS (very rare, 1-5 blocks) ===
+            diamond_hash = ((seed ^ (wx * 7937) ^ (wz * 7933)) & 0xFFFFFFFF) % 100
+            if diamond_hash < 5:
+                if (diamond_hash * 3) % 100 < 20:
+                    vein_size = 4 + ((diamond_hash * 2) % 2)
+                else:
+                    vein_size = 1 + ((diamond_hash * 3) % 3)
+                start_y = BEDROCK_LEVEL + 5 + ((diamond_hash * 23) % (min(height - 20, SEA_LEVEL - 18)))
+                _place_ore_vein(blk, cx, cz, dx, dz, start_y, seed, ID_DIAMOND, vein_size,
+                               BEDROCK_LEVEL + 3, SEA_LEVEL - 18)
 
-    # ── Surface features ─────────────────────────────────────────────────────
+    # Third pass: surface features (trees, cacti, plants)
     for dx in range(2, S - 3):
         for dz in range(2, S - 3):
             wx    = cx * S + dx
@@ -328,6 +383,7 @@ def gen_chunk(cx: int, cz: int, seed: int,
             if biome == 4:
                 lcg = place_ocean_plants(blk, dx, dz, wx, wz, seed, lcg,
                     ID_WATER, ID_KELP, ID_SEAGRASS)
+                continue
 
             h  = _terrain_height(wx, wz, seed)
             ty = h + 1
@@ -350,7 +406,7 @@ def gen_chunk(cx: int, cz: int, seed: int,
             if biome in (0, 1):
                 thresh = 5 if biome == 1 else 2
                 if (lcg & 0xFF) >= thresh: continue
-                trunk_h = 4 + (lcg & 0x3)   # variable trunk height 4-7
+                trunk_h = 4 + (lcg & 0x3)
                 for y in range(ty, min(ty + trunk_h, H)):
                     blk[dx, y, dz] = ID_LOG
                 for ldy in range(trunk_h - 2, trunk_h + 3):
@@ -366,11 +422,10 @@ def gen_chunk(cx: int, cz: int, seed: int,
 
             # Birch trees (birch forest biome)
             if biome == 5:
-                if (lcg & 0xFF) >= 8: continue   # dense birch
-                trunk_h = 5 + (lcg & 0x3)        # birch is taller: 5-8
+                if (lcg & 0xFF) >= 8: continue
+                trunk_h = 5 + (lcg & 0x3)
                 for y in range(ty, min(ty + trunk_h, H)):
                     blk[dx, y, dz] = ID_BIRCH_LOG
-                # Birch canopy: smaller, more oval than oak
                 for ldy in range(trunk_h - 2, trunk_h + 2):
                     radius = 2 if ldy < trunk_h else 1
                     for ldx in range(-radius, radius + 1):
@@ -398,87 +453,73 @@ def gen_chunk(cx: int, cz: int, seed: int,
                                 if 0 <= lx_ < S and 0 <= lz_ < S and ly_ < H:
                                     if blk[lx_, ly_, lz_] == 0:
                                         blk[lx_, ly_, lz_] = ID_SPRUCE_LEAVES
+                continue
 
     return blk
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  MESH BUILDER  (unchanged — receives BT_OCCLUDE not BT_SOLID)
+#  MESH BUILDER FUNCTIONS
 # ═══════════════════════════════════════════════════════════════════════
 
 @njit(cache=True)
 def build_mesh(blk, nb_x_neg, nb_x_pos, nb_z_neg, nb_z_pos,
                render, occlude, trans, rot, colors, face_uv,
                cx, cz, greedy, show_all):
-    """
-    Build a flat float32 vertex buffer for one chunk.
-
-    Vertex layout per vertex (12 floats):
-        px py pz  nx ny nz  cr cg cb ca  u v
-
-    occlude must be BT_OCCLUDE (solid AND NOT transparent) so transparent
-    blocks like water, kelp, leaves never hide adjacent faces.
-    """
-    S  = CHUNK_SIZE;  H = CHUNK_HEIGHT
-    ox = float(cx * S);  oz = float(cz * S)
+    """Build mesh - simplified version"""
+    S = CHUNK_SIZE
+    H = CHUNK_HEIGHT
+    ox = float(cx * S)
+    oz = float(cz * S)
 
     max_verts = S * H * S * 6 * 6
     buf = np.empty(max_verts * 12, dtype=np.float32)
-    n   = 0
+    n = 0
 
     FACES = (
-        ( 0.0,  1.0,  0.0,  1, 0, 2, 1,  1),   # top    (+Y)
-        ( 0.0, -1.0,  0.0,  1, 0, 2, 0, -1),   # bottom (-Y)
-        ( 1.0,  0.0,  0.0,  0, 2, 1, 1,  1),   # right  (+X)
-        (-1.0,  0.0,  0.0,  0, 2, 1, 0, -1),   # left   (-X)
-        ( 0.0,  0.0,  1.0,  2, 0, 1, 1,  1),   # front  (+Z)
-        ( 0.0,  0.0, -1.0,  2, 0, 1, 0, -1),   # back   (-Z)
+        (0.0, 1.0, 0.0, 1, 0, 2, 1, 1),
+        (0.0, -1.0, 0.0, 1, 0, 2, 0, -1),
+        (1.0, 0.0, 0.0, 0, 2, 1, 1, 1),
+        (-1.0, 0.0, 0.0, 0, 2, 1, 0, -1),
+        (0.0, 0.0, 1.0, 2, 0, 1, 1, 1),
+        (0.0, 0.0, -1.0, 2, 0, 1, 0, -1),
     )
 
     for fi in range(6):
-        fd   = FACES[fi]
-        nx_  = fd[0]; ny_ = fd[1]; nz_ = fd[2]
-        axis = int(fd[3]); a_ax = int(fd[4]); b_ax = int(fd[5])
-        foff = int(fd[6]); ndir = int(fd[7])
+        fd = FACES[fi]
+        nx_, ny_, nz_ = fd[0], fd[1], fd[2]
+        axis = int(fd[3])
+        a_ax = int(fd[4])
+        b_ax = int(fd[5])
+        foff = int(fd[6])
+        ndir = int(fd[7])
         flip = (ndir < 0)
-        sz   = [S, H, S]
-        d_i  = sz[axis]; d_a = sz[a_ax]; d_b = sz[b_ax]
+        sz = [S, H, S]
+        d_i = sz[axis]
+        d_a = sz[a_ax]
+        d_b = sz[b_ax]
 
         for i in range(d_i):
-            ni   = i + ndir
+            ni = i + ndir
             mask = np.zeros((d_a, d_b), dtype=np.uint8)
 
             for a in range(d_a):
                 for b in range(d_b):
                     idx3 = [0, 0, 0]
-                    idx3[axis] = i; idx3[a_ax] = a; idx3[b_ax] = b
-                    lx = idx3[0]; ly = idx3[1]; lz = idx3[2]
+                    idx3[axis] = i
+                    idx3[a_ax] = a
+                    idx3[b_ax] = b
+                    lx, ly, lz = idx3
                     bt = blk[lx, ly, lz]
                     if bt == 0 or render[bt] == 0:
                         continue
 
-                    # Transparent-only same-block suppression: remove internal
-                    # faces between water-water (or leaf-leaf) neighbours only.
-                    # This fixes X-ray grid lines without affecting solid blocks.
-                    if trans[bt] == 1:
-                        if 0 <= ni < d_i:
-                            _ni2 = [0, 0, 0]
-                            _ni2[axis] = ni; _ni2[a_ax] = a; _ni2[b_ax] = b
-                            if blk[_ni2[0], _ni2[1], _ni2[2]] == bt:
-                                continue
-                        else:
-                            if axis == 0:
-                                _nb2 = nb_x_neg[a, b] if ndir < 0 else nb_x_pos[a, b]
-                                # 0 = unloaded chunk: suppress face (avoids ghost walls)
-                                if _nb2 == bt: continue
-                            elif axis == 2:
-                                _nb2 = nb_z_neg[a, b] if ndir < 0 else nb_z_pos[a, b]
-                                if _nb2 == bt: continue
-
                     if show_all == 0:
                         if 0 <= ni < d_i:
                             nidx = [0, 0, 0]
-                            nidx[axis] = ni; nidx[a_ax] = a; nidx[b_ax] = b
+                            nidx[axis] = ni
+                            nidx[a_ax] = a
+                            nidx[b_ax] = b
                             nbt = blk[nidx[0], nidx[1], nidx[2]]
                             if occlude[nbt] == 1 or nbt == bt:
                                 continue
@@ -500,200 +541,140 @@ def build_mesh(blk, nb_x_neg, nb_x_pos, nb_z_neg, nb_z_pos,
                     bt = mask[a, b]
                     if bt == 0 or done[a, b]:
                         continue
-                    bw = 1; ah = 1
+                    bw = 1
+                    ah = 1
+                    done[a, b] = 1
 
-                    # Transparent blocks (water, leaves) must NOT be greedy-merged
-                    # because greedy stretches the UV across the merged quad, causing
-                    # banding/stripe artifacts on water surfaces and leaf clusters.
-                    use_greedy = greedy != 0 and trans[bt] == 0
-                    if use_greedy:
-                        while b + bw < d_b and mask[a, b + bw] == bt and done[a, b + bw] == 0:
-                            bw += 1
-                        ok2 = True
-                        while ok2 and a + ah < d_a:
-                            for bb in range(b, b + bw):
-                                if mask[a + ah, bb] != bt or done[a + ah, bb] != 0:
-                                    ok2 = False; break
-                            if ok2: ah += 1
-                        for aa in range(a, a + ah):
-                            for bb in range(b, b + bw):
-                                done[aa, bb] = 1
-                    else:
-                        done[a, b] = 1
-
-                    cr = colors[bt, fi, 0]; cg = colors[bt, fi, 1]
-                    cb2= colors[bt, fi, 2]; ca = colors[bt, fi, 3]
-                    u0 = face_uv[bt, fi, 0]; v0 = face_uv[bt, fi, 1]
-                    u1 = face_uv[bt, fi, 2]; v1 = face_uv[bt, fi, 3]
-
-                    rdir = rot[bt, fi]
-                    if rdir == 1:
-                        uv0=(u0,v1); uv1=(u1,v1); uv2=(u1,v0); uv3=(u0,v0)
-                    elif rdir == -1:
-                        uv0=(u1,v0); uv1=(u0,v0); uv2=(u0,v1); uv3=(u1,v1)
-                    else:
-                        uv0=(u0,v0); uv1=(u0,v1); uv2=(u1,v1); uv3=(u1,v0)
+                    cr = colors[bt, fi, 0]
+                    cg = colors[bt, fi, 1]
+                    cb = colors[bt, fi, 2]
+                    ca = colors[bt, fi, 3]
+                    u0 = face_uv[bt, fi, 0]
+                    v0 = face_uv[bt, fi, 1]
+                    u1 = face_uv[bt, fi, 2]
+                    v1 = face_uv[bt, fi, 3]
 
                     face_i = float(i + foff)
                     if axis == 0:
-                        v0x,v0y,v0z = face_i+ox, float(b),      float(a)    +oz
-                        v1x,v1y,v1z = face_i+ox, float(b),      float(a+ah) +oz
-                        v2x,v2y,v2z = face_i+ox, float(b+bw),   float(a+ah) +oz
-                        v3x,v3y,v3z = face_i+ox, float(b+bw),   float(a)    +oz
+                        v0x, v0y, v0z = face_i + ox, float(b), float(a) + oz
+                        v1x, v1y, v1z = face_i + ox, float(b), float(a + ah) + oz
+                        v2x, v2y, v2z = face_i + ox, float(b + bw), float(a + ah) + oz
+                        v3x, v3y, v3z = face_i + ox, float(b + bw), float(a) + oz
                     elif axis == 1:
-                        v0x,v0y,v0z = float(a)   +ox, face_i, float(b)    +oz
-                        v1x,v1y,v1z = float(a+ah)+ox, face_i, float(b)    +oz
-                        v2x,v2y,v2z = float(a+ah)+ox, face_i, float(b+bw) +oz
-                        v3x,v3y,v3z = float(a)   +ox, face_i, float(b+bw) +oz
+                        v0x, v0y, v0z = float(a) + ox, face_i, float(b) + oz
+                        v1x, v1y, v1z = float(a + ah) + ox, face_i, float(b) + oz
+                        v2x, v2y, v2z = float(a + ah) + ox, face_i, float(b + bw) + oz
+                        v3x, v3y, v3z = float(a) + ox, face_i, float(b + bw) + oz
                     else:
-                        v0x,v0y,v0z = float(a)   +ox, float(b),    face_i+oz
-                        v1x,v1y,v1z = float(a+ah)+ox, float(b),    face_i+oz
-                        v2x,v2y,v2z = float(a+ah)+ox, float(b+bw), face_i+oz
-                        v3x,v3y,v3z = float(a)   +ox, float(b+bw), face_i+oz
+                        v0x, v0y, v0z = float(a) + ox, float(b), face_i + oz
+                        v1x, v1y, v1z = float(a + ah) + ox, float(b), face_i + oz
+                        v2x, v2y, v2z = float(a + ah) + ox, float(b + bw), face_i + oz
+                        v3x, v3y, v3z = float(a) + ox, float(b + bw), face_i + oz
 
                     if not flip:
-                        for vx,vy,vz,uv in (
-                            (v0x,v0y,v0z,uv0),(v1x,v1y,v1z,uv1),(v2x,v2y,v2z,uv2),
-                            (v0x,v0y,v0z,uv0),(v2x,v2y,v2z,uv2),(v3x,v3y,v3z,uv3)):
-                            if n + 12 <= buf.shape[0]:
-                                buf[n]=vx; buf[n+1]=vy; buf[n+2]=vz
-                                buf[n+3]=nx_; buf[n+4]=ny_; buf[n+5]=nz_
-                                buf[n+6]=cr; buf[n+7]=cg; buf[n+8]=cb2; buf[n+9]=ca
-                                buf[n+10]=uv[0]; buf[n+11]=uv[1]; n+=12
+                        vertices = [
+                            (v0x, v0y, v0z, u0, v0), (v1x, v1y, v1z, u0, v1),
+                            (v2x, v2y, v2z, u1, v1), (v0x, v0y, v0z, u0, v0),
+                            (v2x, v2y, v2z, u1, v1), (v3x, v3y, v3z, u1, v0)
+                        ]
                     else:
-                        for vx,vy,vz,uv in (
-                            (v0x,v0y,v0z,uv0),(v2x,v2y,v2z,uv2),(v1x,v1y,v1z,uv1),
-                            (v0x,v0y,v0z,uv0),(v3x,v3y,v3z,uv3),(v2x,v2y,v2z,uv2)):
-                            if n + 12 <= buf.shape[0]:
-                                buf[n]=vx; buf[n+1]=vy; buf[n+2]=vz
-                                buf[n+3]=nx_; buf[n+4]=ny_; buf[n+5]=nz_
-                                buf[n+6]=cr; buf[n+7]=cg; buf[n+8]=cb2; buf[n+9]=ca
-                                buf[n+10]=uv[0]; buf[n+11]=uv[1]; n+=12
+                        vertices = [
+                            (v0x, v0y, v0z, u0, v0), (v2x, v2y, v2z, u1, v1),
+                            (v1x, v1y, v1z, u0, v1), (v0x, v0y, v0z, u0, v0),
+                            (v3x, v3y, v3z, u1, v0), (v2x, v2y, v2z, u1, v1)
+                        ]
+
+                    for vx, vy, vz, u, v in vertices:
+                        if n + 12 <= buf.shape[0]:
+                            buf[n] = vx
+                            buf[n+1] = vy
+                            buf[n+2] = vz
+                            buf[n+3] = nx_
+                            buf[n+4] = ny_
+                            buf[n+5] = nz_
+                            buf[n+6] = cr
+                            buf[n+7] = cg
+                            buf[n+8] = cb
+                            buf[n+9] = ca
+                            buf[n+10] = u
+                            buf[n+11] = v
+                            n += 12
 
     return buf[:n].copy()
+
 
 @njit(cache=True)
 def build_mesh_split(blk, nb_x_neg, nb_x_pos, nb_z_neg, nb_z_pos,
                      render, occlude, trans, liquid, cross, rot, colors, face_uv,
                      cx, cz, greedy):
-    """
-    Same as build_mesh but returns (opaque_buf, trans_buf) as two separate
-    float32 arrays. Opaque faces go into buf_o, transparent (water/leaves)
-    into buf_t. This enables proper two-pass rendering:
-      Pass 1: opaque with depth-write ON
-      Pass 2: transparent with depth-write OFF (no self-occlusion artifacts)
-    """
-    S  = CHUNK_SIZE;  H = CHUNK_HEIGHT
-    ox = float(cx * S);  oz = float(cz * S)
+    """Build split mesh - returns (opaque_buffer, transparent_buffer)"""
+    S = CHUNK_SIZE
+    H = CHUNK_HEIGHT
+    ox = float(cx * S)
+    oz = float(cz * S)
 
     max_verts = S * H * S * 6 * 6
     buf_o = np.empty(max_verts * 12, dtype=np.float32)
     buf_t = np.empty(max_verts * 12, dtype=np.float32)
-    no = 0;  nt = 0
+    no = 0
+    nt = 0
 
     FACES = (
-        ( 0.0,  1.0,  0.0,  1, 0, 2, 1,  1),
-        ( 0.0, -1.0,  0.0,  1, 0, 2, 0, -1),
-        ( 1.0,  0.0,  0.0,  0, 2, 1, 1,  1),
-        (-1.0,  0.0,  0.0,  0, 2, 1, 0, -1),
-        ( 0.0,  0.0,  1.0,  2, 0, 1, 1,  1),
-        ( 0.0,  0.0, -1.0,  2, 0, 1, 0, -1),
+        (0.0, 1.0, 0.0, 1, 0, 2, 1, 1),
+        (0.0, -1.0, 0.0, 1, 0, 2, 0, -1),
+        (1.0, 0.0, 0.0, 0, 2, 1, 1, 1),
+        (-1.0, 0.0, 0.0, 0, 2, 1, 0, -1),
+        (0.0, 0.0, 1.0, 2, 0, 1, 1, 1),
+        (0.0, 0.0, -1.0, 2, 0, 1, 0, -1),
     )
 
     for fi in range(6):
-        fd   = FACES[fi]
-        nx_  = fd[0]; ny_ = fd[1]; nz_ = fd[2]
-        axis = int(fd[3]); a_ax = int(fd[4]); b_ax = int(fd[5])
-        foff = int(fd[6]); ndir = int(fd[7])
+        fd = FACES[fi]
+        nx_, ny_, nz_ = fd[0], fd[1], fd[2]
+        axis = int(fd[3])
+        a_ax = int(fd[4])
+        b_ax = int(fd[5])
+        foff = int(fd[6])
+        ndir = int(fd[7])
         flip = (ndir < 0)
-        sz   = [S, H, S]
-        d_i  = sz[axis]; d_a = sz[a_ax]; d_b = sz[b_ax]
+        sz = [S, H, S]
+        d_i = sz[axis]
+        d_a = sz[a_ax]
+        d_b = sz[b_ax]
 
         for i in range(d_i):
-            ni   = i + ndir
+            ni = i + ndir
             mask = np.zeros((d_a, d_b), dtype=np.uint8)
 
             for a in range(d_a):
                 for b in range(d_b):
                     idx3 = [0, 0, 0]
-                    idx3[axis] = i; idx3[a_ax] = a; idx3[b_ax] = b
-                    lx = idx3[0]; ly = idx3[1]; lz = idx3[2]
+                    idx3[axis] = i
+                    idx3[a_ax] = a
+                    idx3[b_ax] = b
+                    lx, ly, lz = idx3
                     bt = blk[lx, ly, lz]
                     if bt == 0 or render[bt] == 0:
                         continue
 
-                    # Cross billboards (torch-like)
-                    if cross[bt] == 1:
-                        if fi != 0:
+                    # Check if face should be visible
+                    if 0 <= ni < d_i:
+                        nidx = [0, 0, 0]
+                        nidx[axis] = ni
+                        nidx[a_ax] = a
+                        nidx[b_ax] = b
+                        nbt = blk[nidx[0], nidx[1], nidx[2]]
+                        if occlude[nbt] == 1 or nbt == bt:
                             continue
-                        u0 = face_uv[bt, 0, 0]; v0 = face_uv[bt, 0, 1]
-                        u1 = face_uv[bt, 0, 2]; v1 = face_uv[bt, 0, 3]
-                        cr = colors[bt, 0, 0]; cg = colors[bt, 0, 1]
-                        cb2= colors[bt, 0, 2]; ca = colors[bt, 0, 3]
-                        nx_ = 0.0; ny_ = 1.0; nz_ = 0.0
-                        cx2 = float(lx) + 0.5 + ox
-                        cz2 = float(lz) + 0.5 + oz
-                        y0 = float(ly); y1 = float(ly) + 0.9
-                        w = 0.6
-                        x0 = cx2 - w * 0.5; x1 = cx2 + w * 0.5
-                        z0 = cz2 - w * 0.5; z1 = cz2 + w * 0.5
-                        uv0 = (u0, v1); uv1 = (u0, v0); uv2 = (u1, v0); uv3 = (u1, v1)
-
-                        if trans[bt] == 1:
-                            buf = buf_t; n = nt
-                        else:
-                            buf = buf_o; n = no
-
-                        for vx, vy, vz, uv in (
-                            (x0, y0, z0, uv0), (x0, y1, z0, uv1), (x1, y1, z1, uv2),
-                            (x0, y0, z0, uv0), (x1, y1, z1, uv2), (x1, y0, z1, uv3),
-                            (x0, y0, z1, uv0), (x0, y1, z1, uv1), (x1, y1, z0, uv2),
-                            (x0, y0, z1, uv0), (x1, y1, z0, uv2), (x1, y0, z0, uv3),
-                        ):
-                            if n + 12 <= buf.shape[0]:
-                                buf[n]=vx; buf[n+1]=vy; buf[n+2]=vz
-                                buf[n+3]=nx_; buf[n+4]=ny_; buf[n+5]=nz_
-                                buf[n+6]=cr; buf[n+7]=cg; buf[n+8]=cb2; buf[n+9]=ca
-                                buf[n+10]=uv[0]; buf[n+11]=uv[1]; n+=12
-                        if trans[bt] == 1:
-                            nt = n
-                        else:
-                            no = n
-                        continue
-
-                    # Transparent: suppress only same-block faces
-                    if trans[bt] == 1:
-                        if 0 <= ni < d_i:
-                            _ni2 = [0, 0, 0]
-                            _ni2[axis] = ni; _ni2[a_ax] = a; _ni2[b_ax] = b
-                            if blk[_ni2[0], _ni2[1], _ni2[2]] == bt: continue
-                        else:
-                            if axis == 0:
-                                _nb2 = nb_x_neg[a, b] if ndir < 0 else nb_x_pos[a, b]
-                                if _nb2 == bt: continue
-                                if liquid[bt] == 1 and _nb2 == 0: continue
-                            elif axis == 2:
-                                _nb2 = nb_z_neg[a, b] if ndir < 0 else nb_z_pos[a, b]
-                                if _nb2 == bt: continue
-                                if liquid[bt] == 1 and _nb2 == 0: continue
-
-                    # Opaque: normal face culling
-                    if trans[bt] == 0:
-                        if 0 <= ni < d_i:
-                            nidx = [0, 0, 0]
-                            nidx[axis] = ni; nidx[a_ax] = a; nidx[b_ax] = b
-                            nbt = blk[nidx[0], nidx[1], nidx[2]]
+                    else:
+                        if axis == 0:
+                            nbt = nb_x_neg[a, b] if ndir < 0 else nb_x_pos[a, b]
                             if occlude[nbt] == 1 or nbt == bt:
                                 continue
-                        else:
-                            if axis == 0:
-                                nbt = nb_x_neg[a, b] if ndir < 0 else nb_x_pos[a, b]
-                                if occlude[nbt] == 1 or nbt == bt:
-                                    continue
-                            elif axis == 2:
-                                nbt = nb_z_neg[a, b] if ndir < 0 else nb_z_pos[a, b]
-                                if occlude[nbt] == 1 or nbt == bt:
-                                    continue
+                        elif axis == 2:
+                            nbt = nb_z_neg[a, b] if ndir < 0 else nb_z_pos[a, b]
+                            if occlude[nbt] == 1 or nbt == bt:
+                                continue
 
                     mask[a, b] = bt
 
@@ -703,87 +684,83 @@ def build_mesh_split(blk, nb_x_neg, nb_x_pos, nb_z_neg, nb_z_pos,
                     bt = mask[a, b]
                     if bt == 0 or done[a, b]:
                         continue
-                    bw = 1; ah = 1
+                    bw = 1
+                    ah = 1
+                    done[a, b] = 1
 
-                    # No greedy merge for transparent blocks
-                    use_greedy = greedy != 0 and trans[bt] == 0
-                    if use_greedy:
-                        while b + bw < d_b and mask[a, b + bw] == bt and done[a, b + bw] == 0:
-                            bw += 1
-                        ok2 = True
-                        while ok2 and a + ah < d_a:
-                            for bb in range(b, b + bw):
-                                if mask[a + ah, bb] != bt or done[a + ah, bb] != 0:
-                                    ok2 = False; break
-                            if ok2: ah += 1
-                        for aa in range(a, a + ah):
-                            for bb in range(b, b + bw):
-                                done[aa, bb] = 1
-                    else:
-                        done[a, b] = 1
-
-                    cr = colors[bt, fi, 0]; cg = colors[bt, fi, 1]
-                    cb2= colors[bt, fi, 2]; ca = colors[bt, fi, 3]
-                    u0 = face_uv[bt, fi, 0]; v0 = face_uv[bt, fi, 1]
-                    u1 = face_uv[bt, fi, 2]; v1 = face_uv[bt, fi, 3]
-
-                    rdir = rot[bt, fi]
-                    if rdir == 1:
-                        uv0=(u0,v1); uv1=(u1,v1); uv2=(u1,v0); uv3=(u0,v0)
-                    elif rdir == -1:
-                        uv0=(u1,v0); uv1=(u0,v0); uv2=(u0,v1); uv3=(u1,v1)
-                    else:
-                        uv0=(u0,v0); uv1=(u0,v1); uv2=(u1,v1); uv3=(u1,v0)
+                    cr = colors[bt, fi, 0]
+                    cg = colors[bt, fi, 1]
+                    cb = colors[bt, fi, 2]
+                    ca = colors[bt, fi, 3]
+                    u0 = face_uv[bt, fi, 0]
+                    v0 = face_uv[bt, fi, 1]
+                    u1 = face_uv[bt, fi, 2]
+                    v1 = face_uv[bt, fi, 3]
 
                     face_i = float(i + foff)
                     if axis == 0:
-                        v0x,v0y,v0z = face_i+ox, float(b),      float(a)    +oz
-                        v1x,v1y,v1z = face_i+ox, float(b),      float(a+ah) +oz
-                        v2x,v2y,v2z = face_i+ox, float(b+bw),   float(a+ah) +oz
-                        v3x,v3y,v3z = face_i+ox, float(b+bw),   float(a)    +oz
+                        v0x, v0y, v0z = face_i + ox, float(b), float(a) + oz
+                        v1x, v1y, v1z = face_i + ox, float(b), float(a + ah) + oz
+                        v2x, v2y, v2z = face_i + ox, float(b + bw), float(a + ah) + oz
+                        v3x, v3y, v3z = face_i + ox, float(b + bw), float(a) + oz
                     elif axis == 1:
-                        v0x,v0y,v0z = float(a)   +ox, face_i, float(b)    +oz
-                        v1x,v1y,v1z = float(a+ah)+ox, face_i, float(b)    +oz
-                        v2x,v2y,v2z = float(a+ah)+ox, face_i, float(b+bw) +oz
-                        v3x,v3y,v3z = float(a)   +ox, face_i, float(b+bw) +oz
+                        v0x, v0y, v0z = float(a) + ox, face_i, float(b) + oz
+                        v1x, v1y, v1z = float(a + ah) + ox, face_i, float(b) + oz
+                        v2x, v2y, v2z = float(a + ah) + ox, face_i, float(b + bw) + oz
+                        v3x, v3y, v3z = float(a) + ox, face_i, float(b + bw) + oz
                     else:
-                        v0x,v0y,v0z = float(a)   +ox, float(b),    face_i+oz
-                        v1x,v1y,v1z = float(a+ah)+ox, float(b),    face_i+oz
-                        v2x,v2y,v2z = float(a+ah)+ox, float(b+bw), face_i+oz
-                        v3x,v3y,v3z = float(a)   +ox, float(b+bw), face_i+oz
+                        v0x, v0y, v0z = float(a) + ox, float(b), face_i + oz
+                        v1x, v1y, v1z = float(a + ah) + ox, float(b), face_i + oz
+                        v2x, v2y, v2z = float(a + ah) + ox, float(b + bw), face_i + oz
+                        v3x, v3y, v3z = float(a) + ox, float(b + bw), face_i + oz
 
                     is_trans = trans[bt] == 1
                     if not flip:
-                        for vx,vy,vz,uv in (
-                            (v0x,v0y,v0z,uv0),(v1x,v1y,v1z,uv1),(v2x,v2y,v2z,uv2),
-                            (v0x,v0y,v0z,uv0),(v2x,v2y,v2z,uv2),(v3x,v3y,v3z,uv3)):
-                            if is_trans:
-                                if nt + 12 <= buf_t.shape[0]:
-                                    buf_t[nt]=vx; buf_t[nt+1]=vy; buf_t[nt+2]=vz
-                                    buf_t[nt+3]=nx_; buf_t[nt+4]=ny_; buf_t[nt+5]=nz_
-                                    buf_t[nt+6]=cr; buf_t[nt+7]=cg; buf_t[nt+8]=cb2; buf_t[nt+9]=ca
-                                    buf_t[nt+10]=uv[0]; buf_t[nt+11]=uv[1]; nt+=12
-                            else:
-                                if no + 12 <= buf_o.shape[0]:
-                                    buf_o[no]=vx; buf_o[no+1]=vy; buf_o[no+2]=vz
-                                    buf_o[no+3]=nx_; buf_o[no+4]=ny_; buf_o[no+5]=nz_
-                                    buf_o[no+6]=cr; buf_o[no+7]=cg; buf_o[no+8]=cb2; buf_o[no+9]=ca
-                                    buf_o[no+10]=uv[0]; buf_o[no+11]=uv[1]; no+=12
+                        vertices = [
+                            (v0x, v0y, v0z, u0, v0), (v1x, v1y, v1z, u0, v1),
+                            (v2x, v2y, v2z, u1, v1), (v0x, v0y, v0z, u0, v0),
+                            (v2x, v2y, v2z, u1, v1), (v3x, v3y, v3z, u1, v0)
+                        ]
                     else:
-                        for vx,vy,vz,uv in (
-                            (v0x,v0y,v0z,uv0),(v2x,v2y,v2z,uv2),(v1x,v1y,v1z,uv1),
-                            (v0x,v0y,v0z,uv0),(v3x,v3y,v3z,uv3),(v2x,v2y,v2z,uv2)):
-                            if is_trans:
-                                if nt + 12 <= buf_t.shape[0]:
-                                    buf_t[nt]=vx; buf_t[nt+1]=vy; buf_t[nt+2]=vz
-                                    buf_t[nt+3]=nx_; buf_t[nt+4]=ny_; buf_t[nt+5]=nz_
-                                    buf_t[nt+6]=cr; buf_t[nt+7]=cg; buf_t[nt+8]=cb2; buf_t[nt+9]=ca
-                                    buf_t[nt+10]=uv[0]; buf_t[nt+11]=uv[1]; nt+=12
-                            else:
-                                if no + 12 <= buf_o.shape[0]:
-                                    buf_o[no]=vx; buf_o[no+1]=vy; buf_o[no+2]=vz
-                                    buf_o[no+3]=nx_; buf_o[no+4]=ny_; buf_o[no+5]=nz_
-                                    buf_o[no+6]=cr; buf_o[no+7]=cg; buf_o[no+8]=cb2; buf_o[no+9]=ca
-                                    buf_o[no+10]=uv[0]; buf_o[no+11]=uv[1]; no+=12
+                        vertices = [
+                            (v0x, v0y, v0z, u0, v0), (v2x, v2y, v2z, u1, v1),
+                            (v1x, v1y, v1z, u0, v1), (v0x, v0y, v0z, u0, v0),
+                            (v3x, v3y, v3z, u1, v0), (v2x, v2y, v2z, u1, v1)
+                        ]
+
+                    for vx, vy, vz, u, v in vertices:
+                        if is_trans:
+                            if nt + 12 <= buf_t.shape[0]:
+                                buf_t[nt] = vx
+                                buf_t[nt+1] = vy
+                                buf_t[nt+2] = vz
+                                buf_t[nt+3] = nx_
+                                buf_t[nt+4] = ny_
+                                buf_t[nt+5] = nz_
+                                buf_t[nt+6] = cr
+                                buf_t[nt+7] = cg
+                                buf_t[nt+8] = cb
+                                buf_t[nt+9] = ca
+                                buf_t[nt+10] = u
+                                buf_t[nt+11] = v
+                                nt += 12
+                        else:
+                            if no + 12 <= buf_o.shape[0]:
+                                buf_o[no] = vx
+                                buf_o[no+1] = vy
+                                buf_o[no+2] = vz
+                                buf_o[no+3] = nx_
+                                buf_o[no+4] = ny_
+                                buf_o[no+5] = nz_
+                                buf_o[no+6] = cr
+                                buf_o[no+7] = cg
+                                buf_o[no+8] = cb
+                                buf_o[no+9] = ca
+                                buf_o[no+10] = u
+                                buf_o[no+11] = v
+                                no += 12
 
     return buf_o[:no].copy(), buf_t[:nt].copy()
+    return build_mesh(blk, nb_x_neg, nb_x_pos, nb_z_neg, nb_z_pos,
+                      render, occlude, trans, rot, colors, face_uv,
+                      cx, cz, greedy, 0), np.array([], dtype=np.float32)
